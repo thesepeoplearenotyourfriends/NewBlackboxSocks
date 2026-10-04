@@ -251,6 +251,10 @@ public class CrashMonitor {
             
             
             writeCrashLog(crashInfo);
+            Slog.e(TAG, "CRASH_LOGCAT type=" + crashInfo.crashType +
+                    " package=" + crashInfo.packageName +
+                    " exception=" + (throwable == null ? "unknown" : throwable.getClass().getName()) +
+                    " message=" + crashInfo.errorMessage + "\n" + crashInfo.stackTrace);
             
         } catch (Exception e) {
             Slog.e(TAG, "Error handling crash: " + e.getMessage());

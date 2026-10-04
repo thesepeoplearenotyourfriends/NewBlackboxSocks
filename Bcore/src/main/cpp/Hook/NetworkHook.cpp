@@ -21,6 +21,7 @@
 #include <string>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unordered_map>
 #include <vector>
@@ -85,6 +86,58 @@ std::unordered_map<uint32_t, std::string> addressToHostname;
 uint32_t nextFakeOffset;
 std::atomic<bool> proxyProbeAttempted{false};
 std::atomic<bool> loggedUnix{false};
+std::atomic<uint64_t> nextTraceId{0};
+thread_local uint64_t activeConnectTrace = 0;
+int64_t nowMs();
+
+uint64_t nextId() {
+    timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t candidate = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+    uint64_t previous = nextTraceId.load();
+    while (!nextTraceId.compare_exchange_weak(previous, std::max(candidate, previous + 1))) { }
+    return std::max(candidate, previous + 1);
+}
+
+const char *processName() {
+    static std::string name = [] {
+        char buffer[256]{};
+        int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+        ssize_t count = fd >= 0 ? read(fd, buffer, sizeof(buffer) - 1) : -1;
+        if (fd >= 0) close(fd);
+        return count > 0 ? std::string(buffer, strnlen(buffer, static_cast<size_t>(count))) : std::string("unknown");
+    }();
+    return name.c_str();
+}
+
+uint64_t traceEnter(const char *layer, const char *api, const char *detail) {
+    uint64_t id = nextId();
+    __android_log_print(ANDROID_LOG_DEBUG, "BBNET", "event=%llu ts=%lld pid=%d tid=%ld process=%s guest_pkg=process-boundary "
+          "layer=%s api=%s state=ENTER %s", static_cast<unsigned long long>(id),
+          static_cast<long long>(nowMs()), getpid(), syscall(SYS_gettid), processName(), layer, api, detail ? detail : "");
+    return id;
+}
+
+void traceExit(uint64_t id, const char *layer, const char *api, long long result, int error,
+               const char *detail = "") {
+    __android_log_print(ANDROID_LOG_DEBUG, "BBNET", "event=%llu ts=%lld pid=%d tid=%ld process=%s guest_pkg=process-boundary "
+          "layer=%s api=%s state=%s return=%lld errno=%d %s", static_cast<unsigned long long>(id),
+          static_cast<long long>(nowMs()), getpid(), syscall(SYS_gettid), processName(), layer, api,
+          result < 0 ? "FAIL" : "EXIT", result, error, detail);
+}
+
+std::string endpoint(const sockaddr *address, socklen_t length) {
+    char ip[INET6_ADDRSTRLEN] = "unknown"; int port = -1;
+    if (address && address->sa_family == AF_INET && length >= sizeof(sockaddr_in)) {
+        const auto *a = reinterpret_cast<const sockaddr_in *>(address);
+        inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip)); port = ntohs(a->sin_port);
+    } else if (address && address->sa_family == AF_INET6 && length >= sizeof(sockaddr_in6)) {
+        const auto *a = reinterpret_cast<const sockaddr_in6 *>(address);
+        inet_ntop(AF_INET6, &a->sin6_addr, ip, sizeof(ip)); port = ntohs(a->sin6_port);
+    } else if (address && address->sa_family == AF_UNIX) {
+        strcpy(ip, "AF_UNIX");
+    }
+    return std::string("ip=") + ip + " port=" + std::to_string(port);
+}
 
 struct UdpState {
     std::mutex mutex;
@@ -181,6 +234,17 @@ bool socksReplyFailure(uint8_t reply, int error) {
 }
 
 bool negotiate(int fd, const sockaddr_in &destination, const std::string *hostname, int64_t deadline) {
+    char destinationIp[INET_ADDRSTRLEN], proxyIp[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &destination.sin_addr, destinationIp, sizeof(destinationIp));
+    inet_ntop(AF_INET, &config.proxy.sin_addr, proxyIp, sizeof(proxyIp));
+    __android_log_print(ANDROID_LOG_DEBUG, "BBNET",
+          "event=%llu ts=%lld pid=%d tid=%ld process=%s guest_pkg=process-boundary layer=SOCKS "
+          "api=SOCKS5.CONNECT state=ENTER fd=%d original_ip=%s port=%u recovered_host=%s "
+          "request_type=%s proxy_ip=%s proxy_port=%u",
+          static_cast<unsigned long long>(activeConnectTrace ? activeConnectTrace : nextId()),
+          static_cast<long long>(nowMs()), getpid(), syscall(SYS_gettid), processName(), fd, destinationIp,
+          ntohs(destination.sin_port), hostname ? hostname->c_str() : "none",
+          hostname ? "DOMAIN" : "IPv4", proxyIp, ntohs(config.proxy.sin_port));
     const bool auth = !config.user.empty() || !config.password.empty();
     // Do not offer no-auth when credentials were requested: accepting it would allow
     // a proxy (or an on-path endpoint) to silently downgrade authentication.
@@ -224,7 +288,14 @@ bool negotiate(int fd, const sockaddr_in &destination, const std::string *hostna
     uint8_t header[4];
     if (!readAll(fd, header, sizeof(header), deadline)) return socksFailure("reply-header-read", errno);
     if (header[0] != 5 || header[2] != 0) return socksFailure("reply-header-read", EPROTO);
-    if (header[1] != 0) return socksReplyFailure(header[1], replyErrno(header[1]));
+    if (header[1] != 0) {
+        __android_log_print(ANDROID_LOG_DEBUG, "BBNET",
+              "event=%llu ts=%lld pid=%d tid=%ld process=%s guest_pkg=process-boundary layer=SOCKS "
+              "api=SOCKS5.CONNECT state=FAIL fd=%d socks_reply=%u errno=%d",
+              static_cast<unsigned long long>(activeConnectTrace), static_cast<long long>(nowMs()),
+              getpid(), syscall(SYS_gettid), processName(), fd, header[1], replyErrno(header[1]));
+        return socksReplyFailure(header[1], replyErrno(header[1]));
+    }
     size_t tail = 0;
     if (header[3] == 1) tail = 6;
     else if (header[3] == 4) tail = 18;
@@ -235,6 +306,11 @@ bool negotiate(int fd, const sockaddr_in &destination, const std::string *hostna
     } else { return socksFailure("reply-header-read", EPROTO); }
     uint8_t discard[257];
     if (!readAll(fd, discard, tail, deadline)) return socksFailure("reply-tail-read", errno);
+    __android_log_print(ANDROID_LOG_DEBUG, "BBNET",
+          "event=%llu ts=%lld pid=%d tid=%ld process=%s guest_pkg=process-boundary layer=SOCKS "
+          "api=SOCKS5.CONNECT state=EXIT fd=%d return=0 socks_reply=0 errno=0",
+          static_cast<unsigned long long>(activeConnectTrace), static_cast<long long>(nowMs()),
+          getpid(), syscall(SYS_gettid), processName(), fd);
     return true;
 }
 
@@ -369,7 +445,10 @@ int syntheticAddress(const char *node, uint32_t *address) {
     auto existing = hostnameToAddress.find(hostname);
     if (existing != hostnameToAddress.end()) {
         *address = existing->second;
-        ALOGD("NetworkHook: synthetic domain mapping reused");
+        char ip[INET_ADDRSTRLEN]; in_addr value{*address}; inet_ntop(AF_INET, &value, ip, sizeof(ip));
+        uint64_t trace = traceEnter("SYNTHETIC_IP", "syntheticAddress.lookup", ("host=" + hostname).c_str());
+        traceExit(trace, "SYNTHETIC_IP", "syntheticAddress.lookup", 0, 0,
+                  (std::string("host=") + hostname + " synthetic_ip=" + ip + " mapping=REUSED").c_str());
         return 0;
     }
     while (nextFakeOffset < kFakeCapacity) {
@@ -378,7 +457,10 @@ int syntheticAddress(const char *node, uint32_t *address) {
         hostnameToAddress.emplace(hostname, candidate);
         addressToHostname.emplace(candidate, hostname);
         *address = candidate;
-        ALOGD("NetworkHook: synthetic domain mapping allocated (total=%zu)", hostnameToAddress.size());
+        char ip[INET_ADDRSTRLEN]; in_addr value{*address}; inet_ntop(AF_INET, &value, ip, sizeof(ip));
+        uint64_t trace = traceEnter("SYNTHETIC_IP", "syntheticAddress.allocate", ("host=" + hostname).c_str());
+        traceExit(trace, "SYNTHETIC_IP", "syntheticAddress.allocate", 0, 0,
+                  (std::string("host=") + hostname + " synthetic_ip=" + ip + " mapping=ALLOCATED").c_str());
         return 0;
     }
     return EAI_MEMORY;
@@ -404,18 +486,37 @@ int resolveSynthetic(Resolver original, const char *node, const char *service,
     return error;
 }
 
-int hookedGetAddrInfo(const char *node, const char *service, const addrinfo *hints, addrinfo **result) {
+int hookedGetAddrInfoImpl(const char *node, const char *service, const addrinfo *hints, addrinfo **result) {
     if (hints && hints->ai_family == AF_INET6 && isOrdinaryHostname(node)) return EAI_FAMILY;
     return resolveSynthetic(originalGetAddrInfo, node, service, hints, result);
 }
 
+int hookedGetAddrInfo(const char *node, const char *service, const addrinfo *hints, addrinfo **result) {
+    std::string detail = std::string("host=") + (node ? node : "null") + " service=" +
+                         (service ? service : "null");
+    uint64_t trace = traceEnter("NATIVE_RESOLVER", "getaddrinfo", detail.c_str());
+    int rc = hookedGetAddrInfoImpl(node, service, hints, result);
+    traceExit(trace, "NATIVE_RESOLVER", "getaddrinfo", rc == 0 ? 0 : -1,
+              rc == EAI_SYSTEM ? errno : 0, (std::string("eai=") + std::to_string(rc)).c_str());
+    return rc;
+}
+
 int hookedAndroidGetAddrInfoForNet(const char *node, const char *service, const addrinfo *hints,
                                    unsigned netId, unsigned mark, addrinfo **result) {
-    if (hints && hints->ai_family == AF_INET6 && isOrdinaryHostname(node)) return EAI_FAMILY;
+    std::string detail = std::string("host=") + (node ? node : "null") + " service=" +
+                         (service ? service : "null") + " net_id=" + std::to_string(netId);
+    uint64_t trace = traceEnter("NATIVE_RESOLVER", "android_getaddrinfofornet", detail.c_str());
+    if (hints && hints->ai_family == AF_INET6 && isOrdinaryHostname(node)) {
+        traceExit(trace, "NATIVE_RESOLVER", "android_getaddrinfofornet", -1, 0, "eai=EAI_FAMILY");
+        return EAI_FAMILY;
+    }
     auto original = [netId, mark](const char *n, const char *s, const addrinfo *h, addrinfo **r) {
         return originalAndroidGetAddrInfoForNet(n, s, h, netId, mark, r);
     };
-    return resolveSynthetic(original, node, service, hints, result);
+    int rc = resolveSynthetic(original, node, service, hints, result);
+    traceExit(trace, "NATIVE_RESOLVER", "android_getaddrinfofornet", rc == 0 ? 0 : -1,
+              rc == EAI_SYSTEM ? errno : 0, (std::string("eai=") + std::to_string(rc)).c_str());
+    return rc;
 }
 
 bool socksAuthenticate(int fd, int64_t deadline) {
@@ -569,7 +670,7 @@ ssize_t udpSend(int fd, const void *buffer, size_t size, int flags,
     return -1;
 }
 
-int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
+int hookedConnectImpl(int fd, const sockaddr *address, socklen_t length) {
     if (!config.requested) return originalConnect(fd, address, length);
     if (!address || length < sizeof(sa_family_t)) { errno = EINVAL; return -1; }
     if (address->sa_family == AF_UNIX) {
@@ -721,7 +822,21 @@ int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
     return reportInProgress ? -1 : result;
 }
 
-ssize_t hookedSendTo(int fd, const void *buffer, size_t size, int flags,
+int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
+    std::string target = endpoint(address, length);
+    uint64_t trace = traceEnter("NATIVE_SOCKET", "connect",
+            (std::string("fd=") + std::to_string(fd) + " original_" + target).c_str());
+    activeConnectTrace = trace;
+    int result = hookedConnectImpl(fd, address, length);
+    int error = result < 0 ? errno : 0;
+    traceExit(trace, "NATIVE_SOCKET", "connect", result, error,
+              (std::string("original_") + target).c_str());
+    activeConnectTrace = 0;
+    errno = error;
+    return result;
+}
+
+ssize_t hookedSendToImpl(int fd, const void *buffer, size_t size, int flags,
                      const sockaddr *address, socklen_t length) {
     if (!config.requested) return originalSendTo(fd, buffer, size, flags, address, length);
     if (address && address->sa_family == AF_UNIX)
@@ -733,6 +848,16 @@ ssize_t hookedSendTo(int fd, const void *buffer, size_t size, int flags,
     if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &tl) || (domain != AF_INET && domain != AF_INET6))
         return originalSendTo(fd, buffer, size, flags, address, length);
     return udpSend(fd, buffer, size, flags, address, length);
+}
+
+ssize_t hookedSendTo(int fd, const void *buffer, size_t size, int flags,
+                     const sockaddr *address, socklen_t length) {
+    std::string target = endpoint(address, length);
+    uint64_t trace = traceEnter("NATIVE_SOCKET", "sendto",
+            (std::string("fd=") + std::to_string(fd) + " bytes=" + std::to_string(size) + " " + target).c_str());
+    ssize_t result = hookedSendToImpl(fd, buffer, size, flags, address, length);
+    int error = result < 0 ? errno : 0;
+    traceExit(trace, "NATIVE_SOCKET", "sendto", result, error, target.c_str()); errno = error; return result;
 }
 
 bool sameEndpoint(const sockaddr_storage &expected, socklen_t, const sockaddr_storage &actual, socklen_t) {
@@ -809,7 +934,7 @@ ssize_t hookedRecvFrom(int fd, void *buffer, size_t size, int flags, sockaddr *s
     return udpReceive(fd, buffer, size, flags, source, length, nullptr);
 }
 
-ssize_t hookedSendMsg(int fd, const msghdr *message, int flags) {
+ssize_t hookedSendMsgImpl(int fd, const msghdr *message, int flags) {
     if (!config.requested) return originalSendMsg(fd, message, flags);
     if (message->msg_name && reinterpret_cast<const sockaddr *>(message->msg_name)->sa_family == AF_UNIX)
         return originalSendMsg(fd, message, flags);
@@ -827,6 +952,15 @@ ssize_t hookedSendMsg(int fd, const msghdr *message, int flags) {
     std::vector<uint8_t> data(total); size_t at = 0;
     for (size_t i = 0; i < message->msg_iovlen; ++i) { memcpy(data.data() + at, message->msg_iov[i].iov_base, message->msg_iov[i].iov_len); at += message->msg_iov[i].iov_len; }
     return udpSend(fd, data.data(), data.size(), flags, reinterpret_cast<const sockaddr *>(message->msg_name), message->msg_namelen);
+}
+
+ssize_t hookedSendMsg(int fd, const msghdr *message, int flags) {
+    std::string target = endpoint(reinterpret_cast<const sockaddr *>(message ? message->msg_name : nullptr),
+                                  message ? message->msg_namelen : 0);
+    uint64_t trace = traceEnter("NATIVE_SOCKET", "sendmsg",
+            (std::string("fd=") + std::to_string(fd) + " " + target).c_str());
+    ssize_t result = hookedSendMsgImpl(fd, message, flags); int error = result < 0 ? errno : 0;
+    traceExit(trace, "NATIVE_SOCKET", "sendmsg", result, error, target.c_str()); errno = error; return result;
 }
 
 ssize_t hookedRecvMsg(int fd, msghdr *message, int flags) {
@@ -879,11 +1013,16 @@ ssize_t hookedReadV(int fd, const iovec *vectors, int count) {
 }
 
 int hookedSocket(int domain, int type, int protocol) {
+    uint64_t trace = traceEnter("NATIVE_SOCKET", "socket",
+            (std::string("domain=") + std::to_string(domain) + " type=" + std::to_string(type) +
+             " protocol=" + std::to_string(protocol)).c_str());
     int fd = originalSocket(domain, type, protocol);
     if (config.requested && fd >= 0 && (domain == AF_INET || domain == AF_INET6) &&
         ((type & 0xf) != SOCK_STREAM && (type & 0xf) != SOCK_DGRAM))
         ALOGE("NetworkPolicy: unhandled Internet path=socket type=%d protocol=%d", type & 0xf, protocol);
-    return fd;
+    int error = fd < 0 ? errno : 0;
+    traceExit(trace, "NATIVE_SOCKET", "socket", fd, error, (std::string("fd=") + std::to_string(fd)).c_str());
+    errno = error; return fd;
 }
 int hookedClose(int fd) { { std::lock_guard<std::mutex> lock(udpStatesMutex); udpStates.erase(fd); } return originalClose(fd); }
 void duplicateState(int from, int to) { std::lock_guard<std::mutex> lock(udpStatesMutex); auto it = udpStates.find(from); if (it != udpStates.end()) udpStates[to] = it->second; else udpStates.erase(to); }

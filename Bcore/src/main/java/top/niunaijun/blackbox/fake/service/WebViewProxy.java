@@ -15,6 +15,7 @@ import top.niunaijun.blackbox.fake.hook.ClassInvocationStub;
 import top.niunaijun.blackbox.fake.hook.MethodHook;
 import top.niunaijun.blackbox.fake.hook.ProxyMethod;
 import top.niunaijun.blackbox.utils.Slog;
+import top.niunaijun.blackbox.utils.NetworkTrace;
 import top.niunaijun.blackbox.app.BActivityThread;
 
 
@@ -291,7 +292,35 @@ public class WebViewProxy extends ClassInvocationStub {
                 }
             }
             
-            return method.invoke(who, args);
+            String url = args != null && args.length > 0 ? String.valueOf(args[0]) : "null";
+            long trace = NetworkTrace.enter("WEBVIEW", "WebView.loadUrl",
+                    "url=" + url + " caller=" + NetworkTrace.caller());
+            try {
+                Object result = method.invoke(who, args);
+                NetworkTrace.exit(trace, "WEBVIEW", "WebView.loadUrl", "return=" + NetworkTrace.describe(result));
+                return result;
+            } catch (Throwable error) {
+                NetworkTrace.fail(trace, "WEBVIEW", "WebView.loadUrl", "url=" + url, error);
+                throw error;
+            }
+        }
+    }
+
+    @ProxyMethod("postUrl")
+    public static class PostUrl extends MethodHook {
+        @Override
+        protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            String url = args != null && args.length > 0 ? String.valueOf(args[0]) : "null";
+            long trace = NetworkTrace.enter("WEBVIEW", "WebView.postUrl",
+                    "url=" + url + " caller=" + NetworkTrace.caller());
+            try {
+                Object result = method.invoke(who, args);
+                NetworkTrace.exit(trace, "WEBVIEW", "WebView.postUrl", "return=" + NetworkTrace.describe(result));
+                return result;
+            } catch (Throwable error) {
+                NetworkTrace.fail(trace, "WEBVIEW", "WebView.postUrl", "url=" + url, error);
+                throw error;
+            }
         }
     }
 }

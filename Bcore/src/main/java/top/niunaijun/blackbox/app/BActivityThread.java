@@ -80,6 +80,7 @@ import top.niunaijun.blackbox.utils.Reflector;
 import top.niunaijun.blackbox.utils.SafeContextWrapper;
 import top.niunaijun.blackbox.utils.GlobalContextWrapper;
 import top.niunaijun.blackbox.utils.Slog;
+import top.niunaijun.blackbox.utils.NetworkTrace;
 import top.niunaijun.blackbox.utils.compat.ActivityManagerCompat;
 import top.niunaijun.blackbox.utils.compat.BuildCompat;
 import top.niunaijun.blackbox.utils.compat.ContextCompat;
@@ -400,6 +401,9 @@ public class BActivityThread extends IBActivityThread.Stub {
         }
 
         NativeCore.init(Build.VERSION.SDK_INT);
+        NetworkTrace.event("PROCESS", "handleBindApplication", "READY",
+                "process=" + processName + " guest_pkg=" + packageName +
+                        " native_hooks=YES java_hooks=YES binder_hooks=YES network_observable=YES");
         assert packageContext != null;
         IOCore.get().enableRedirect(packageContext);
 
