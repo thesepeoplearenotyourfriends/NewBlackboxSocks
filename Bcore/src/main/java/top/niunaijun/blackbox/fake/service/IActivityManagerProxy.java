@@ -55,6 +55,7 @@ import top.niunaijun.blackbox.utils.compat.BuildCompat;
 import top.niunaijun.blackbox.utils.compat.ParceledListSliceCompat;
 import top.niunaijun.blackbox.utils.compat.TaskDescriptionCompat;
 import top.niunaijun.blackbox.utils.Slog;
+import top.niunaijun.blackbox.utils.NetworkTrace;
 
 import static android.content.Context.RECEIVER_EXPORTED;
 import static android.content.Context.RECEIVER_NOT_EXPORTED;
@@ -222,9 +223,24 @@ public class IActivityManagerProxy extends ClassInvocationStub {
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
             Intent intent = (Intent) args[1];
             String resolvedType = (String) args[2];
+            long trace = intent != null && isWebViewProcessBoundary(intent)
+                    ? NetworkTrace.enter("WEBVIEW_PROCESS", "IActivityManager.startService",
+                    "component=" + intent.getComponent() + " package=" + intent.getPackage() +
+                            " action=" + intent.getAction() +
+                            " hooks=UNKNOWN network_visibility=UNKNOWN boundary=SYSTEM_SERVICE_REQUEST") : 0;
             ResolveInfo resolveInfo = BlackBoxCore.getBPackageManager().resolveService(intent, 0, resolvedType, BActivityThread.getUserId());
             if (resolveInfo == null) {
-                return method.invoke(who, args);
+                try {
+                    Object result = method.invoke(who, args);
+                    if (trace != 0) NetworkTrace.exit(trace, "WEBVIEW_PROCESS", "IActivityManager.startService",
+                            "return=" + NetworkTrace.describe(result) +
+                                    " guest_bind_path=NO hooks=UNKNOWN network_visibility=UNKNOWN");
+                    return result;
+                } catch (Throwable error) {
+                    if (trace != 0) NetworkTrace.fail(trace, "WEBVIEW_PROCESS", "IActivityManager.startService",
+                            "guest_bind_path=NO hooks=UNKNOWN network_visibility=UNKNOWN", error);
+                    throw error;
+                }
             }
 
             int requireForegroundIndex = getRequireForeground();
@@ -232,7 +248,11 @@ public class IActivityManagerProxy extends ClassInvocationStub {
             if (requireForegroundIndex != -1) {
                 requireForeground = (boolean) args[requireForegroundIndex];
             }
-            return BlackBoxCore.getBActivityManager().startService(intent, resolvedType, requireForeground, BActivityThread.getUserId());
+            Object result = BlackBoxCore.getBActivityManager().startService(intent, resolvedType, requireForeground, BActivityThread.getUserId());
+            if (trace != 0) NetworkTrace.exit(trace, "WEBVIEW_PROCESS", "IActivityManager.startService",
+                    "return=" + NetworkTrace.describe(result) +
+                            " guest_bind_path=YES hooks=PENDING_GUEST_BIND network_visibility=PENDING_GUEST_BIND");
+            return result;
         }
 
         public int getRequireForeground() {
@@ -338,7 +358,12 @@ public class IActivityManagerProxy extends ClassInvocationStub {
         }
     }
 
-    public static Object BindServiceCommon(Object who, Method method, Object[] args,int callingPackageIndex) throws Throwable {
+    public static Object BindServiceCommon(Object who, Method method, Object[] args, int callingPackageIndex,
+                                           Object originalInstanceName, boolean instanceNameRewritten) throws Throwable {
+        long webViewTrace = 0;
+        Intent originalIntent = null;
+        int flagsIndex = getFlagsIndex(args);
+        long flagsBefore = getBindFlags(args, flagsIndex);
         try {
             Intent intent = (Intent) args[2];
             String resolvedType = (String) args[3];
@@ -348,6 +373,22 @@ public class IActivityManagerProxy extends ClassInvocationStub {
             if (intent == null) {
                 Slog.w(TAG, "BindServiceCommon: Intent is null, proceeding with original call");
                 return method.invoke(who, args);
+            }
+
+            originalIntent = new Intent(intent);
+
+            if (isWebViewProcessBoundary(intent)) {
+                webViewTrace = NetworkTrace.enter("WEBVIEW_PROCESS", "IActivityManager." + method.getName(),
+                        "original_component=" + originalIntent.getComponent() +
+                                " original_package=" + targetPackage(originalIntent) +
+                                " action=" + intent.getAction() +
+                                " original_instance_name=" + originalInstanceName +
+                                " effective_instance_name=" + getEffectiveInstanceName(method, args) +
+                                " instance_name_rewritten=" + yesNo(instanceNameRewritten) +
+                                " flags_before=" + hexFlags(flagsBefore) +
+                                " bind_external_before=" + yesNo(hasBindExternal(flagsBefore)) +
+                                " hooks=UNKNOWN network_visibility=UNKNOWN " +
+                                "boundary=SYSTEM_SERVICE_REQUEST caller=" + NetworkTrace.caller());
             }
 
             
@@ -376,7 +417,6 @@ public class IActivityManagerProxy extends ClassInvocationStub {
                 
                 if (proxyIntent != null && proxyIntent.getComponent() != null && 
                     proxyIntent.getComponent().getPackageName().equals(BlackBoxCore.getHostPkg())){
-                    int flagsIndex = getFlagsIndex(args);
                     if (flagsIndex >= 0) {
                         int flags = MethodParameterUtils.toInt(args[flagsIndex]);
                         flags &= ~Context.BIND_EXTERNAL_SERVICE;
@@ -387,14 +427,99 @@ public class IActivityManagerProxy extends ClassInvocationStub {
 
                 if (proxyIntent != null) {
                     args[2] = proxyIntent;
-                    return method.invoke(who, args);
+                    Object result = method.invoke(who, args);
+                    if (webViewTrace != 0) logWebViewBindExit(webViewTrace, method, result,
+                            originalIntent, proxyIntent, args, flagsIndex, flagsBefore,
+                            originalInstanceName, instanceNameRewritten);
+                    return result;
                 }
             }
-            return method.invoke(who, args);
+            Object result = method.invoke(who, args);
+            if (webViewTrace != 0) logWebViewBindExit(webViewTrace, method, result,
+                    originalIntent, (Intent) args[2], args, flagsIndex, flagsBefore,
+                    originalInstanceName, instanceNameRewritten);
+            return result;
         } catch (Exception e) {
+            if (webViewTrace != 0) NetworkTrace.fail(webViewTrace, "WEBVIEW_PROCESS",
+                    "IActivityManager." + method.getName(),
+                    bindDecisionDetails("FAILED", originalIntent,
+                            args[2] instanceof Intent ? (Intent) args[2] : null, args, flagsIndex,
+                            flagsBefore, originalInstanceName, instanceNameRewritten,
+                            "hooks=UNKNOWN network_visibility=UNKNOWN"), e);
             Slog.e(TAG, "BindServiceCommon: Unexpected error", e);
             return method.invoke(who, args);
         }
+    }
+
+    private static void logWebViewBindExit(long trace, Method method, Object result,
+                                           Intent originalIntent, Intent resultingIntent, Object[] args,
+                                           int flagsIndex, long flagsBefore, Object originalInstanceName,
+                                           boolean instanceNameRewritten) {
+        ComponentName original = originalIntent == null ? null : originalIntent.getComponent();
+        ComponentName resulting = resultingIntent == null ? null : resultingIntent.getComponent();
+        boolean blackBoxProxy = resulting != null &&
+                BlackBoxCore.getHostPkg().equals(resulting.getPackageName()) &&
+                !Objects.equals(original, resulting);
+        String route = blackBoxProxy ? "BLACKBOX_PROXY" :
+                resultingIntent != null ? "SYSTEM_PASSTHROUGH" : "UNKNOWN";
+        String hooks = blackBoxProxy ?
+                "hooks=PENDING_GUEST_BIND network_visibility=PENDING_GUEST_BIND" :
+                "hooks=NOT_BLACKBOX_GUEST_BOUND network_visibility=UNKNOWN";
+        NetworkTrace.exit(trace, "WEBVIEW_PROCESS", "IActivityManager." + method.getName(),
+                "return=" + NetworkTrace.describe(result) + " " +
+                        bindDecisionDetails(route, originalIntent, resultingIntent, args, flagsIndex,
+                                flagsBefore, originalInstanceName, instanceNameRewritten, hooks));
+    }
+
+    private static String bindDecisionDetails(String route, Intent originalIntent, Intent resultingIntent,
+                                              Object[] args, int flagsIndex, long flagsBefore,
+                                              Object originalInstanceName, boolean instanceNameRewritten,
+                                              String hooks) {
+        long flagsAfter = getBindFlags(args, flagsIndex);
+        return "route=" + route +
+                " original_component=" + (originalIntent == null ? null : originalIntent.getComponent()) +
+                " original_package=" + targetPackage(originalIntent) +
+                " resulting_component=" + (resultingIntent == null ? null : resultingIntent.getComponent()) +
+                " resulting_package=" + targetPackage(resultingIntent) +
+                " original_instance_name=" + originalInstanceName +
+                " effective_instance_name=" +
+                (instanceNameRewritten && args != null && args.length > 6 ? args[6] : "not_applicable") +
+                " instance_name_rewritten=" + yesNo(instanceNameRewritten) +
+                " flags_before=" + hexFlags(flagsBefore) + " flags_after=" + hexFlags(flagsAfter) +
+                " bind_external_before=" + yesNo(hasBindExternal(flagsBefore)) +
+                " bind_external_after=" + yesNo(hasBindExternal(flagsAfter)) + " " + hooks;
+    }
+
+    private static String targetPackage(Intent intent) {
+        if (intent == null) return null;
+        return intent.getComponent() != null ? intent.getComponent().getPackageName() : intent.getPackage();
+    }
+
+    private static Object getEffectiveInstanceName(Method method, Object[] args) {
+        String name = method == null ? "bindIsolatedService" : method.getName();
+        return "bindIsolatedService".equals(name) && args != null && args.length > 6 ? args[6] : "not_applicable";
+    }
+
+    private static long getBindFlags(Object[] args, int index) {
+        return index >= 0 && args[index] instanceof Number ? ((Number) args[index]).longValue() : 0;
+    }
+
+    private static boolean hasBindExternal(long flags) {
+        return (flags & Context.BIND_EXTERNAL_SERVICE) != 0;
+    }
+
+    private static String hexFlags(long flags) {
+        return "0x" + Long.toHexString(flags);
+    }
+
+    private static String yesNo(boolean value) {
+        return value ? "YES" : "NO";
+    }
+
+    private static boolean isWebViewProcessBoundary(Intent intent) {
+        String value = intent.toUri(0).toLowerCase(java.util.Locale.ROOT);
+        return value.contains("webview") || value.contains("chromium") || value.contains("sandbox") ||
+                value.contains("renderer") || value.contains("networkservice") || value.contains("network_service");
     }
 
     private static int getFlagsIndex(Object[] args) {
@@ -412,7 +537,7 @@ public class IActivityManagerProxy extends ClassInvocationStub {
 
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
-            return BindServiceCommon(who,method,args,6);
+            return BindServiceCommon(who, method, args, 6, null, false);
         }
 
         @Override
@@ -426,7 +551,7 @@ public class IActivityManagerProxy extends ClassInvocationStub {
     public static class bindServiceInstance extends MethodHook {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
-            return BindServiceCommon(who,method,args,7);
+            return BindServiceCommon(who, method, args, 7, null, false);
         }
 
         @Override
@@ -440,9 +565,20 @@ public class IActivityManagerProxy extends ClassInvocationStub {
     public static class BindIsolatedService extends MethodHook {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
-            
+            Object originalInstanceName = args != null && args.length > 6 ? args[6] : null;
+            Intent intent = args != null && args.length > 2 && args[2] instanceof Intent ? (Intent) args[2] : null;
+            int flagsIndex = getFlagsIndex(args);
+            long flagsBefore = getBindFlags(args, flagsIndex);
+            if (intent != null && isWebViewProcessBoundary(intent)) {
+                NetworkTrace.event("WEBVIEW_PROCESS", "IActivityManager.bindIsolatedService", "OBSERVED",
+                        "component=" + intent.getComponent() + " package=" + intent.getPackage() +
+                                " original_instance_name=" + originalInstanceName +
+                                " flags_before=" + hexFlags(flagsBefore) +
+                                " bind_external_before=" + yesNo(hasBindExternal(flagsBefore)) +
+                                " effective_instance_name=null instance_name_rewritten=YES");
+            }
             args[6] = null;
-            return BindServiceCommon(who,method,args,7);
+            return BindServiceCommon(who, method, args, 7, originalInstanceName, true);
         }
 
         @Override
