@@ -80,7 +80,6 @@ import top.niunaijun.blackbox.utils.Reflector;
 import top.niunaijun.blackbox.utils.SafeContextWrapper;
 import top.niunaijun.blackbox.utils.GlobalContextWrapper;
 import top.niunaijun.blackbox.utils.Slog;
-import top.niunaijun.blackbox.utils.NetworkTrace;
 import top.niunaijun.blackbox.utils.compat.ActivityManagerCompat;
 import top.niunaijun.blackbox.utils.compat.BuildCompat;
 import top.niunaijun.blackbox.utils.compat.ContextCompat;
@@ -390,18 +389,7 @@ public class BActivityThread extends IBActivityThread.Stub {
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            String suffix = getUserId() + ":" + packageName + ":" + processName;
-            long webViewTrace = NetworkTrace.enter("WEBVIEW_PROVIDER", "WebView.setDataDirectorySuffix",
-                    "suffix=" + suffix + " navigation_hooks=NOT_PRESENT caller=" + NetworkTrace.caller());
-            try {
-                WebView.setDataDirectorySuffix(suffix);
-                NetworkTrace.exit(webViewTrace, "WEBVIEW_PROVIDER", "WebView.setDataDirectorySuffix",
-                        "return=void provider_boundary=OBSERVED navigation_visibility=NOT_PRESENT");
-            } catch (Throwable error) {
-                NetworkTrace.fail(webViewTrace, "WEBVIEW_PROVIDER", "WebView.setDataDirectorySuffix",
-                        "provider_boundary=FAIL navigation_visibility=NOT_PRESENT", error);
-                throw error;
-            }
+            WebView.setDataDirectorySuffix(getUserId() + ":" + packageName + ":" + processName);
         }
 
         VirtualRuntime.setupRuntime(processName, applicationInfo);
@@ -411,12 +399,7 @@ public class BActivityThread extends IBActivityThread.Stub {
             BRCompatibility.get().setTargetSdkVersion(applicationInfo.targetSdkVersion);
         }
 
-        boolean nativeNetworkHooksRequested = NativeCore.init(Build.VERSION.SDK_INT);
-        NetworkTrace.event("PROCESS", "handleBindApplication", "READY",
-                "process=" + processName + " guest_pkg=" + packageName +
-                        " native_network_hooks=" + (nativeNetworkHooksRequested ? "REQUESTED" : "NOT_PRESENT") +
-                        " java_hooks=READY binder_hooks=READY network_observable=" +
-                        (nativeNetworkHooksRequested ? "PENDING_NATIVE_INSTALL" : "JAVA_BINDER_ONLY"));
+        NativeCore.init(Build.VERSION.SDK_INT);
         assert packageContext != null;
         IOCore.get().enableRedirect(packageContext);
 

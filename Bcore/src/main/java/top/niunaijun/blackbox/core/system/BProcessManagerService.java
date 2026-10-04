@@ -29,7 +29,6 @@ import top.niunaijun.blackbox.entity.AppConfig;
 import top.niunaijun.blackbox.proxy.ProxyManifest;
 import top.niunaijun.blackbox.utils.FileUtils;
 import top.niunaijun.blackbox.utils.Slog;
-import top.niunaijun.blackbox.utils.NetworkTrace;
 import top.niunaijun.blackbox.utils.compat.ApplicationThreadCompat;
 import top.niunaijun.blackbox.utils.compat.BundleCompat;
 import top.niunaijun.blackbox.utils.provider.ProviderCall;
@@ -48,9 +47,6 @@ public class BProcessManagerService implements ISystemService {
     }
 
     public ProcessRecord startProcessLocked(String packageName, String processName, int userId, int bpid, int callingPid) {
-        NetworkTrace.event("PROCESS", "startProcessLocked", "REQUEST",
-                "process=" + processName + " guest_pkg=" + packageName + " requester_pid=" + callingPid +
-                        " hooks=NOT_YET_LOADED network_observable=NOT_YET");
         ApplicationInfo info = BPackageManagerService.get().getApplicationInfo(packageName, 0, userId);
         if (info == null)
             return null;
@@ -98,10 +94,6 @@ public class BProcessManagerService implements ISystemService {
                 app = null;
             } else {
                 app.pid = getPid(BlackBoxCore.getContext(), ProxyManifest.getProcessName(app.bpid));
-                NetworkTrace.event("PROCESS", "startProcessLocked", "CREATED",
-                        "pid=" + app.pid + " process=" + processName + " guest_pkg=" + packageName +
-                                " native_hooks=PENDING_GUEST_BIND java_hooks=PENDING_GUEST_BIND " +
-                                " binder_hooks=PENDING_GUEST_BIND network_observable=PENDING_GUEST_BIND");
             }
         }
         return app;
