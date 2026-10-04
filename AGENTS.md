@@ -1,0 +1,1 @@
+Do not run any build, test, Gradle task, or compilation command before making the requested code changes. The current revision has already been validated externally. First inspect, then edit. Only after the implementation is complete should you run assemblePerformance once for validation, unless a concrete compile failure requires another run.
