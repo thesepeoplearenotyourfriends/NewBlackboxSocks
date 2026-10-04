@@ -13,6 +13,7 @@
 #include <Hook/BinderHook.h>
 #include <Hook/DexFileHook.h>
 #include <Hook/RuntimeHook.h>
+#include <Hook/NetworkHook.h>
 #include "Utils/HexDump.h"
 #include "hidden_api.h"
 
@@ -78,6 +79,7 @@ void nativeHook(JNIEnv *env) {
 
     BinderHook::init(env);
     DexFileHook::init(env);
+    NetworkHook::init();
 }
 
 void hideXposed(JNIEnv *env, jclass clazz) {
@@ -85,7 +87,8 @@ void hideXposed(JNIEnv *env, jclass clazz) {
     VMClassLoaderHook::hideXposed();
 }
 
-void init(JNIEnv *env, jobject clazz, jint api_level) {
+void init(JNIEnv *env, jobject clazz, jint api_level, jboolean guest, jboolean socksEnabled,
+          jstring socksHost, jint socksPort, jstring socksUser, jstring socksPassword) {
     ALOGD("NativeCore init.");
     VMEnv.api_level = api_level;
     VMEnv.NativeCoreClass = (jclass) env->NewGlobalRef(env->FindClass(VMCORE_CLASS));
@@ -96,6 +99,7 @@ void init(JNIEnv *env, jobject clazz, jint api_level) {
                                                     "(Ljava/io/File;)Ljava/io/File;");
     VMEnv.loadEmptyDex = env->GetStaticMethodID(VMEnv.NativeCoreClass, "loadEmptyDex",
                                                 "()[J");
+    NetworkHook::configure(env, guest && socksEnabled, socksHost, socksPort, socksUser, socksPassword);
 
     JniHook::InitJniHook(env, api_level);
 }
@@ -137,7 +141,7 @@ static JNINativeMethod gMethods[] = {
         {"hideXposed", "()V",                                     (void *) hideXposed},
         {"addIORule",  "(Ljava/lang/String;Ljava/lang/String;)V", (void *) addIORule},
         {"enableIO",   "()V",                                     (void *) enableIO},
-        {"init",       "(I)V",                                    (void *) init},
+        {"initNative", "(IZZLjava/lang/String;ILjava/lang/String;Ljava/lang/String;)V", (void *) init},
 };
 
 int registerNativeMethods(JNIEnv *env, const char *className,

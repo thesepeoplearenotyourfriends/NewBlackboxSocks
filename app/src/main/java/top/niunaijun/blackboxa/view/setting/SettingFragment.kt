@@ -12,6 +12,8 @@ import top.niunaijun.blackboxa.view.gms.GmsManagerActivity
 class SettingFragment : PreferenceFragmentCompat() {
 
     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+        // Match AppSharedPreferenceDelegate so the guest bootstrap can snapshot SOCKS settings.
+        preferenceManager.sharedPreferencesName = "AppSharedPreferenceDelegate"
         setPreferencesFromResource(R.xml.setting, rootKey)
 
         initGms()
