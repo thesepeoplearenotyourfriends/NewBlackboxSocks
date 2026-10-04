@@ -71,8 +71,7 @@ public class IDnsResolverProxy extends BinderInvocationStub {
             try {
                 
                 List<InetAddress> fallbackServers = new ArrayList<>();
-                fallbackServers.add(InetAddress.getByName("8.8.8.8"));
-                fallbackServers.add(InetAddress.getByName("8.8.4.4"));
+                // No public-DNS fallback: native fake-IP/SOCKS DOMAIN owns name resolution.
                 return fallbackServers;
             } catch (Exception e) {
                 Slog.e(TAG, "Error creating fallback DNS result: " + e.getMessage());

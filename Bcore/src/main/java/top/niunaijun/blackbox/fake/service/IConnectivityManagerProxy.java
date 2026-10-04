@@ -173,8 +173,7 @@ public class IConnectivityManagerProxy extends BinderInvocationStub {
             
             java.util.List<java.net.InetAddress> dnsServers = new java.util.ArrayList<>();
             try {
-                dnsServers.add(java.net.InetAddress.getByName("8.8.8.8"));
-                dnsServers.add(java.net.InetAddress.getByName("8.8.4.4"));
+                // Deliberately empty: guest names are resolved remotely by SOCKS DOMAIN.
                 
                 
                 Method setDnsServersMethod = linkProperties.getClass().getMethod("setDnsServers", java.util.List.class);
@@ -451,7 +450,7 @@ public class IConnectivityManagerProxy extends BinderInvocationStub {
                     Object linkProperties = IConnectivityManagerProxy.createLinkProperties();
                     
                     if (linkProperties != null) {
-                        Slog.d(TAG, "Created LinkProperties with DNS configuration for sandboxed app (fallback)");
+                        Slog.d(TAG, "Created SOCKS virtual LinkProperties without DNS servers");
                         return linkProperties;
                     }
                 } catch (Exception e) {
@@ -492,8 +491,7 @@ public class IConnectivityManagerProxy extends BinderInvocationStub {
             try {
                 
                 java.util.List<java.net.InetAddress> dnsServers = new java.util.ArrayList<>();
-                dnsServers.add(java.net.InetAddress.getByName("8.8.8.8"));
-                dnsServers.add(java.net.InetAddress.getByName("8.8.4.4"));
+                // Deliberately empty: guest names are resolved remotely by SOCKS DOMAIN.
                 Slog.d(TAG, "Returning system DNS servers for sandboxed app");
                 return dnsServers;
             } catch (Exception e) {
