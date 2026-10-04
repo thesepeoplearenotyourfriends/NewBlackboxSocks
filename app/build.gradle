@@ -3,6 +3,8 @@ plugins {
     alias(libs.plugins.jetbrains.kotlin.android)
 }
 
+def ciAbi = providers.gradleProperty("ciAbi").orNull
+
 android {
 
     namespace 'top.niunaijun.blackboxa'
@@ -21,9 +23,14 @@ android {
             abi {
                 enable true
                 reset()
-                
-                include 'armeabi-v7a', "arm64-v8a"
-                universalApk true
+
+                if (ciAbi) {
+                    include ciAbi
+                    universalApk false
+                } else {
+                    include 'armeabi-v7a', "arm64-v8a"
+                    universalApk true
+                }
             }
         }
     }
@@ -73,25 +80,25 @@ dependencies {
     androidTestImplementation libs.espresso.core
 
     implementation "androidx.preference:preference-ktx:1.1.1"
-    
+
     implementation "androidx.lifecycle:lifecycle-viewmodel-ktx:2.3.1"
     implementation "androidx.lifecycle:lifecycle-livedata-ktx:2.3.1"
     implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.3.1"
 
-    
+
     implementation 'androidx.recyclerview:recyclerview:1.2.1'
     implementation 'com.gitee.cbfg5210:RVAdapter:0.3.7'
 
-    
+
     implementation 'com.github.Othershe:CornerLabelView:1.0.0'
-    
+
 //    implementation 'com.github.nukc.stateview:kotlin:2.2.0'
-    
+
     implementation 'com.github.Ferfalk:SimpleSearchView:0.2.0'
     implementation 'com.tbuonomo:dotsindicator:4.2'
-    
+
     implementation 'org.osmdroid:osmdroid-android:6.1.11'
-    
+
     implementation 'com.afollestad.material-dialogs:core:3.3.0'
     implementation 'com.afollestad.material-dialogs:input:3.3.0'
 
@@ -99,7 +106,7 @@ dependencies {
 
 
 
-    
+
     implementation 'androidx.work:work-runtime:2.7.1'
 
 }
