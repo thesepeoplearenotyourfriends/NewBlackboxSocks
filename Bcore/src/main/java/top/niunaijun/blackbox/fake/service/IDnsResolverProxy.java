@@ -11,6 +11,7 @@ import top.niunaijun.blackbox.fake.hook.BinderInvocationStub;
 import top.niunaijun.blackbox.fake.hook.MethodHook;
 import top.niunaijun.blackbox.fake.hook.ProxyMethod;
 import top.niunaijun.blackbox.utils.Slog;
+import top.niunaijun.blackbox.utils.NetworkTrace;
 
 
 public class IDnsResolverProxy extends BinderInvocationStub {
@@ -50,19 +51,30 @@ public class IDnsResolverProxy extends BinderInvocationStub {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
             Slog.d(TAG, "Intercepting DNS resolution request");
+            StringBuilder detail = new StringBuilder("args=");
+            if (args != null) for (Object arg : args) detail.append('[').append(NetworkTrace.describe(arg)).append(']');
+            detail.append(" caller=").append(NetworkTrace.caller());
+            long trace = NetworkTrace.enter("BINDER_RESOLVER", "IDnsResolver.resolveDns", detail.toString());
             try {
                 
                 Object result = method.invoke(who, args);
                 if (result != null) {
+                    NetworkTrace.exit(trace, "BINDER_RESOLVER", "IDnsResolver.resolveDns",
+                            "return=" + NetworkTrace.describe(result));
                     return result;
                 }
                 
                 
                 Slog.w(TAG, "DNS resolution failed, providing fallback");
-                return createFallbackDnsResult();
+                Object fallback = createFallbackDnsResult();
+                NetworkTrace.exit(trace, "BINDER_RESOLVER", "IDnsResolver.resolveDns",
+                        "return=" + NetworkTrace.describe(fallback) + " observed_null_result=true");
+                return fallback;
                 
             } catch (Exception e) {
                 Slog.w(TAG, "DNS resolution error, providing fallback: " + e.getMessage());
+                NetworkTrace.fail(trace, "BINDER_RESOLVER", "IDnsResolver.resolveDns",
+                        "return=existing_empty_result", e);
                 return createFallbackDnsResult();
             }
         }

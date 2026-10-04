@@ -29,18 +29,22 @@ public class NativeCore {
     }
 
     private static native void initNative(int apiLevel, boolean guest, boolean enabled,
-                                          String host, int port, String user, String password);
+                                          String host, int port, String user, String password,
+                                          String guestPackage);
 
     /** Snapshot host settings once. Native connect interception performs no JNI or preference I/O. */
-    public static void init(int apiLevel) {
+    public static boolean init(int apiLevel) {
         boolean guest = BlackBoxCore.get().isBlackProcess();
         SharedPreferences preferences = BlackBoxCore.getContext().getSharedPreferences(
                 "AppSharedPreferenceDelegate", Context.MODE_PRIVATE);
-        initNative(apiLevel, guest, preferences.getBoolean("mSocksEnabled", false),
+        boolean networkHooksRequested = guest && preferences.getBoolean("mSocksEnabled", false);
+        initNative(apiLevel, guest, networkHooksRequested,
                 preferences.getString("mSocksHost", "127.0.0.1"),
                 parsePort(preferences.getString("mSocksPort", "1080")),
                 preferences.getString("mSocksUser", ""),
-                preferences.getString("mSocksPassword", ""));
+                preferences.getString("mSocksPassword", ""),
+                guest ? BActivityThread.getAppPackageName() : null);
+        return networkHooksRequested;
     }
 
     private static int parsePort(String value) {

@@ -15,6 +15,7 @@ import top.niunaijun.blackbox.fake.hook.ClassInvocationStub;
 import top.niunaijun.blackbox.fake.hook.MethodHook;
 import top.niunaijun.blackbox.fake.hook.ProxyMethod;
 import top.niunaijun.blackbox.utils.Reflector;
+import top.niunaijun.blackbox.utils.NetworkTrace;
 
 
 public class OsStub extends ClassInvocationStub {
@@ -49,7 +50,8 @@ public class OsStub extends ClassInvocationStub {
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
         String name = method.getName();
-        if (isNetworkMethod(name) && sLoggedNetworkMethods.add(name)) {
+        boolean network = isNetworkMethod(name);
+        if (network && sLoggedNetworkMethods.add(name)) {
             // libcore.io.Posix implements these methods with the correspondingly named
             // Bionic calls (android_getaddrinfo uses android_getaddrinfofornet). The
             // startup-fatal native hook set covers each data-plane entry point; methods
@@ -70,7 +72,19 @@ public class OsStub extends ClassInvocationStub {
                 }
             }
         }
-        return super.invoke(proxy, method, args);
+        if (!network) return super.invoke(proxy, method, args);
+        StringBuilder detail = new StringBuilder("args=");
+        if (args != null) for (Object arg : args) detail.append('[').append(NetworkTrace.describe(arg)).append(']');
+        detail.append(" caller=").append(NetworkTrace.caller());
+        long trace = NetworkTrace.enter("LIBCORE", "Os." + name, detail.toString());
+        try {
+            Object result = super.invoke(proxy, method, args);
+            NetworkTrace.exit(trace, "LIBCORE", "Os." + name, "return=" + NetworkTrace.describe(result));
+            return result;
+        } catch (Throwable error) {
+            NetworkTrace.fail(trace, "LIBCORE", "Os." + name, "return=THROW", error);
+            throw error;
+        }
     }
 
     private static boolean isNetworkMethod(String name) {

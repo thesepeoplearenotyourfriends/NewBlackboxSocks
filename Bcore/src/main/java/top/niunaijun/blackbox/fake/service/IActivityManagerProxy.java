@@ -55,6 +55,7 @@ import top.niunaijun.blackbox.utils.compat.BuildCompat;
 import top.niunaijun.blackbox.utils.compat.ParceledListSliceCompat;
 import top.niunaijun.blackbox.utils.compat.TaskDescriptionCompat;
 import top.niunaijun.blackbox.utils.Slog;
+import top.niunaijun.blackbox.utils.NetworkTrace;
 
 import static android.content.Context.RECEIVER_EXPORTED;
 import static android.content.Context.RECEIVER_NOT_EXPORTED;
@@ -222,9 +223,24 @@ public class IActivityManagerProxy extends ClassInvocationStub {
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
             Intent intent = (Intent) args[1];
             String resolvedType = (String) args[2];
+            long trace = intent != null && isWebViewProcessBoundary(intent)
+                    ? NetworkTrace.enter("WEBVIEW_PROCESS", "IActivityManager.startService",
+                    "component=" + intent.getComponent() + " package=" + intent.getPackage() +
+                            " action=" + intent.getAction() +
+                            " hooks=UNKNOWN network_visibility=UNKNOWN boundary=SYSTEM_SERVICE_REQUEST") : 0;
             ResolveInfo resolveInfo = BlackBoxCore.getBPackageManager().resolveService(intent, 0, resolvedType, BActivityThread.getUserId());
             if (resolveInfo == null) {
-                return method.invoke(who, args);
+                try {
+                    Object result = method.invoke(who, args);
+                    if (trace != 0) NetworkTrace.exit(trace, "WEBVIEW_PROCESS", "IActivityManager.startService",
+                            "return=" + NetworkTrace.describe(result) +
+                                    " guest_bind_path=NO hooks=UNKNOWN network_visibility=UNKNOWN");
+                    return result;
+                } catch (Throwable error) {
+                    if (trace != 0) NetworkTrace.fail(trace, "WEBVIEW_PROCESS", "IActivityManager.startService",
+                            "guest_bind_path=NO hooks=UNKNOWN network_visibility=UNKNOWN", error);
+                    throw error;
+                }
             }
 
             int requireForegroundIndex = getRequireForeground();
@@ -232,7 +248,11 @@ public class IActivityManagerProxy extends ClassInvocationStub {
             if (requireForegroundIndex != -1) {
                 requireForeground = (boolean) args[requireForegroundIndex];
             }
-            return BlackBoxCore.getBActivityManager().startService(intent, resolvedType, requireForeground, BActivityThread.getUserId());
+            Object result = BlackBoxCore.getBActivityManager().startService(intent, resolvedType, requireForeground, BActivityThread.getUserId());
+            if (trace != 0) NetworkTrace.exit(trace, "WEBVIEW_PROCESS", "IActivityManager.startService",
+                    "return=" + NetworkTrace.describe(result) +
+                            " guest_bind_path=YES hooks=PENDING_GUEST_BIND network_visibility=PENDING_GUEST_BIND");
+            return result;
         }
 
         public int getRequireForeground() {
@@ -339,6 +359,7 @@ public class IActivityManagerProxy extends ClassInvocationStub {
     }
 
     public static Object BindServiceCommon(Object who, Method method, Object[] args,int callingPackageIndex) throws Throwable {
+        long webViewTrace = 0;
         try {
             Intent intent = (Intent) args[2];
             String resolvedType = (String) args[3];
@@ -348,6 +369,13 @@ public class IActivityManagerProxy extends ClassInvocationStub {
             if (intent == null) {
                 Slog.w(TAG, "BindServiceCommon: Intent is null, proceeding with original call");
                 return method.invoke(who, args);
+            }
+
+            if (isWebViewProcessBoundary(intent)) {
+                webViewTrace = NetworkTrace.enter("WEBVIEW_PROCESS", "IActivityManager." + method.getName(),
+                        "component=" + intent.getComponent() + " package=" + intent.getPackage() +
+                                " action=" + intent.getAction() + " hooks=UNKNOWN network_visibility=UNKNOWN " +
+                                "boundary=SYSTEM_SERVICE_REQUEST caller=" + NetworkTrace.caller());
             }
 
             
@@ -387,14 +415,32 @@ public class IActivityManagerProxy extends ClassInvocationStub {
 
                 if (proxyIntent != null) {
                     args[2] = proxyIntent;
-                    return method.invoke(who, args);
+                    Object result = method.invoke(who, args);
+                    if (webViewTrace != 0) NetworkTrace.exit(webViewTrace, "WEBVIEW_PROCESS",
+                            "IActivityManager." + method.getName(),
+                            "return=" + NetworkTrace.describe(result) +
+                                    " guest_bind_path=YES hooks=PENDING_GUEST_BIND network_visibility=PENDING_GUEST_BIND");
+                    return result;
                 }
             }
-            return method.invoke(who, args);
+            Object result = method.invoke(who, args);
+            if (webViewTrace != 0) NetworkTrace.exit(webViewTrace, "WEBVIEW_PROCESS",
+                    "IActivityManager." + method.getName(),
+                    "return=" + NetworkTrace.describe(result) +
+                            " guest_bind_path=NO hooks=UNKNOWN network_visibility=UNKNOWN");
+            return result;
         } catch (Exception e) {
+            if (webViewTrace != 0) NetworkTrace.fail(webViewTrace, "WEBVIEW_PROCESS",
+                    "IActivityManager." + method.getName(), "hooks=UNKNOWN network_visibility=UNKNOWN", e);
             Slog.e(TAG, "BindServiceCommon: Unexpected error", e);
             return method.invoke(who, args);
         }
+    }
+
+    private static boolean isWebViewProcessBoundary(Intent intent) {
+        String value = intent.toUri(0).toLowerCase(java.util.Locale.ROOT);
+        return value.contains("webview") || value.contains("chromium") || value.contains("sandbox") ||
+                value.contains("renderer") || value.contains("networkservice") || value.contains("network_service");
     }
 
     private static int getFlagsIndex(Object[] args) {
