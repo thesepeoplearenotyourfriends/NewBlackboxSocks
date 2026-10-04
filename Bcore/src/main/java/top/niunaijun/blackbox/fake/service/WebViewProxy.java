@@ -276,22 +276,4 @@ public class WebViewProxy extends ClassInvocationStub {
     }
 
     
-    @ProxyMethod("loadUrl")
-    public static class LoadUrl extends MethodHook {
-        @Override
-        protected Object hook(Object who, Method method, Object[] args) throws Throwable {
-            if (args != null && args.length > 0) {
-                String url = (String) args[0];
-                Slog.d(TAG, "WebView: loadUrl called with: " + url);
-                
-                
-                if (url != null && url.startsWith("file://")) {
-                    
-                    Slog.d(TAG, "WebView: Handling file URL: " + url);
-                }
-            }
-            
-            return method.invoke(who, args);
-        }
-    }
 }
