@@ -41,6 +41,12 @@ android {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+        performance {
+            initWith release
+            debuggable false
+            signingConfig signingConfigs.debug
+            matchingFallbacks = ['release']
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_21
