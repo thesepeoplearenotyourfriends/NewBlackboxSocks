@@ -5,40 +5,22 @@
 #include "xdl.h"
 
 #include <arpa/inet.h>
-#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <netdb.h>
 #include <poll.h>
-#include <algorithm>
-#include <mutex>
 #include <string>
 #include <sys/socket.h>
 #include <time.h>
-#include <unordered_map>
 #include <unistd.h>
 
 namespace {
 constexpr int kTimeoutMs = 10000;
 using ConnectFn = int (*)(int, const sockaddr *, socklen_t);
 ConnectFn originalConnect;
-using GetAddrInfoFn = int (*)(const char *, const char *, const addrinfo *, addrinfo **);
-using AndroidGetAddrInfoForNetFn = int (*)(const char *, const char *, const addrinfo *,
-                                           unsigned, unsigned, addrinfo **);
-GetAddrInfoFn originalGetAddrInfo;
-AndroidGetAddrInfoForNetFn originalAndroidGetAddrInfoForNet;
-
-constexpr uint32_t kFakeNetwork = 0xc6120000U; // 198.18.0.0, in host byte order.
-constexpr uint32_t kFakeMask = 0xfffe0000U;
-constexpr uint32_t kFakeCapacity = 1U << 17;
-std::mutex mappingsMutex;
-std::unordered_map<std::string, uint32_t> hostnameToAddress;
-std::unordered_map<uint32_t, std::string> addressToHostname;
-uint32_t nextFakeOffset;
 
 struct Config {
     // requested deliberately remains true when validation fails.  That distinction is
@@ -107,7 +89,7 @@ int replyErrno(uint8_t reply) {
     }
 }
 
-bool negotiate(int fd, const sockaddr_in &destination, const std::string *hostname, int64_t deadline) {
+bool negotiate(int fd, const sockaddr_in &destination, int64_t deadline) {
     const bool auth = !config.user.empty() || !config.password.empty();
     // Do not offer no-auth when credentials were requested: accepting it would allow
     // a proxy (or an on-path endpoint) to silently downgrade authentication.
@@ -132,21 +114,10 @@ bool negotiate(int fd, const sockaddr_in &destination, const std::string *hostna
         return false;
     }
 
-    if (hostname) {
-        if (hostname->empty() || hostname->size() > 255) { errno = EINVAL; return false; }
-        std::string request;
-        request.reserve(hostname->size() + 7);
-        request.append("\x05\x01\x00\x03", 4);
-        request.push_back(static_cast<char>(hostname->size()));
-        request += *hostname;
-        request.append(reinterpret_cast<const char *>(&destination.sin_port), 2);
-        if (!writeAll(fd, reinterpret_cast<const uint8_t *>(request.data()), request.size(), deadline)) return false;
-    } else {
-        uint8_t request[10] = {5, 1, 0, 1};
-        memcpy(request + 4, &destination.sin_addr.s_addr, 4);
-        memcpy(request + 8, &destination.sin_port, 2);
-        if (!writeAll(fd, request, sizeof(request), deadline)) return false;
-    }
+    uint8_t request[10] = {5, 1, 0, 1};
+    memcpy(request + 4, &destination.sin_addr.s_addr, 4);
+    memcpy(request + 8, &destination.sin_port, 2);
+    if (!writeAll(fd, request, sizeof(request), deadline)) return false;
     uint8_t header[4];
     if (!readAll(fd, header, sizeof(header), deadline)) return false;
     if (header[0] != 5 || header[2] != 0) { errno = EPROTO; return false; }
@@ -163,105 +134,6 @@ bool negotiate(int fd, const sockaddr_in &destination, const std::string *hostna
     return readAll(fd, discard, tail, deadline);
 }
 
-bool isFakeAddress(uint32_t networkAddress) {
-    return (ntohl(networkAddress) & kFakeMask) == kFakeNetwork;
-}
-
-bool mappedHostname(uint32_t networkAddress, std::string *hostname) {
-    std::lock_guard<std::mutex> lock(mappingsMutex);
-    auto found = addressToHostname.find(networkAddress);
-    if (found == addressToHostname.end()) return false;
-    *hostname = found->second;
-    return true;
-}
-
-bool shouldSynthesize(const char *node, const addrinfo *hints) {
-    if (!node || !*node) return false;
-    if (hints && (hints->ai_flags & AI_NUMERICHOST)) return false;
-    in_addr ipv4{};
-    in6_addr ipv6{};
-    if (inet_pton(AF_INET, node, &ipv4) == 1 || inet_pton(AF_INET6, node, &ipv6) == 1) return false;
-    std::string hostname(node);
-    std::transform(hostname.begin(), hostname.end(), hostname.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    while (hostname.size() > 1 && hostname.back() == '.') hostname.pop_back();
-    if (hostname == "localhost" ||
-        (hostname.size() > 10 && hostname.compare(hostname.size() - 10, 10, ".localhost") == 0)) return false;
-    return !hints || hints->ai_family == AF_UNSPEC || hints->ai_family == AF_INET;
-}
-
-bool isOrdinaryHostname(const char *node) {
-    if (!node || !*node) return false;
-    in_addr ipv4{};
-    in6_addr ipv6{};
-    if (inet_pton(AF_INET, node, &ipv4) == 1 || inet_pton(AF_INET6, node, &ipv6) == 1) return false;
-    std::string hostname(node);
-    std::transform(hostname.begin(), hostname.end(), hostname.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    while (hostname.size() > 1 && hostname.back() == '.') hostname.pop_back();
-    return hostname != "localhost" &&
-           !(hostname.size() > 10 && hostname.compare(hostname.size() - 10, 10, ".localhost") == 0);
-}
-
-int syntheticAddress(const char *node, uint32_t *address) {
-    std::string hostname(node);
-    if (hostname.size() > 255) return EAI_NONAME;
-    std::transform(hostname.begin(), hostname.end(), hostname.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    while (hostname.size() > 1 && hostname.back() == '.') hostname.pop_back();
-    std::lock_guard<std::mutex> lock(mappingsMutex);
-    auto existing = hostnameToAddress.find(hostname);
-    if (existing != hostnameToAddress.end()) {
-        *address = existing->second;
-        ALOGD("NetworkHook: synthetic domain mapping reused");
-        return 0;
-    }
-    while (nextFakeOffset < kFakeCapacity) {
-        uint32_t candidate = htonl(kFakeNetwork + nextFakeOffset++);
-        if (candidate == config.proxy.sin_addr.s_addr || addressToHostname.count(candidate)) continue;
-        hostnameToAddress.emplace(hostname, candidate);
-        addressToHostname.emplace(candidate, hostname);
-        *address = candidate;
-        ALOGD("NetworkHook: synthetic domain mapping allocated (total=%zu)", hostnameToAddress.size());
-        return 0;
-    }
-    return EAI_MEMORY;
-}
-
-template<typename Resolver>
-int resolveSynthetic(Resolver original, const char *node, const char *service,
-                     const addrinfo *hints, addrinfo **result) {
-    if (!shouldSynthesize(node, hints)) return original(node, service, hints, result);
-    uint32_t address;
-    int error = syntheticAddress(node, &address);
-    if (error != 0) { ALOGE("NetworkHook: resolver synthesis failed (EAI=%d)", error); return error; }
-    char numeric[INET_ADDRSTRLEN];
-    in_addr value{address};
-    if (!inet_ntop(AF_INET, &value, numeric, sizeof(numeric))) return EAI_SYSTEM;
-    addrinfo numericHints{};
-    if (hints) numericHints = *hints;
-    numericHints.ai_family = AF_INET;
-    numericHints.ai_flags |= AI_NUMERICHOST;
-    numericHints.ai_flags &= ~AI_ADDRCONFIG;
-    error = original(numeric, service, &numericHints, result);
-    if (error != 0) ALOGE("NetworkHook: numeric synthetic resolver failed (EAI=%d)", error);
-    return error;
-}
-
-int hookedGetAddrInfo(const char *node, const char *service, const addrinfo *hints, addrinfo **result) {
-    if (hints && hints->ai_family == AF_INET6 && isOrdinaryHostname(node)) return EAI_FAMILY;
-    return resolveSynthetic(originalGetAddrInfo, node, service, hints, result);
-}
-
-int hookedAndroidGetAddrInfoForNet(const char *node, const char *service, const addrinfo *hints,
-                                   unsigned netId, unsigned mark, addrinfo **result) {
-    if (hints && hints->ai_family == AF_INET6 && isOrdinaryHostname(node)) return EAI_FAMILY;
-    auto original = [netId, mark](const char *n, const char *s, const addrinfo *h, addrinfo **r) {
-        return originalAndroidGetAddrInfoForNet(n, s, h, netId, mark, r);
-    };
-    return resolveSynthetic(original, node, service, hints, result);
-}
-
 int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
     if (!config.requested) return originalConnect(fd, address, length);
     if (!address || length < sizeof(sa_family_t)) { errno = EINVAL; return -1; }
@@ -273,16 +145,6 @@ int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
     if (type != SOCK_STREAM) { errno = EPROTONOSUPPORT; return -1; }
     if (!config.valid) { errno = EINVAL; return -1; }
 
-    const auto &destination = *reinterpret_cast<const sockaddr_in *>(address);
-    std::string hostname;
-    const bool synthetic = mappedHostname(destination.sin_addr.s_addr, &hostname);
-    if (isFakeAddress(destination.sin_addr.s_addr) && !synthetic) {
-        errno = EHOSTUNREACH;
-        ALOGE("NetworkHook: unmapped synthetic-range connect blocked");
-        return -1;
-    }
-    if (synthetic) ALOGD("NetworkHook: synthetic domain connect recognized");
-
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     if (!(flags & O_NONBLOCK) && fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) return -1;
@@ -293,17 +155,13 @@ int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &errorLength) == 0 && error == 0) result = 0;
         else { errno = error ? error : errno; result = -1; }
     }
-    if (result == 0 && !negotiate(fd, destination, synthetic ? &hostname : nullptr, deadline)) {
+    if (result == 0 && !negotiate(fd, *reinterpret_cast<const sockaddr_in *>(address), deadline)) {
         // This descriptor is connected to the proxy, not the requested peer.  Poison it
         // before returning so callers cannot accidentally use or retry this partial path.
         int negotiationErrno = errno;
         shutdown(fd, SHUT_RDWR);
         errno = negotiationErrno;
         result = -1;
-    }
-    if (synthetic) {
-        if (result == 0) ALOGD("NetworkHook: SOCKS DOMAIN connect succeeded");
-        else ALOGE("NetworkHook: SOCKS DOMAIN connect failed (errno=%d)", errno);
     }
     int savedErrno = errno;
     if (!(flags & O_NONBLOCK) && fcntl(fd, F_SETFL, flags) != 0 && result == 0) { savedErrno = errno; result = -1; }
@@ -347,23 +205,5 @@ void NetworkHook::init() {
         if (handle) xdl_close(handle);
         abort();
     }
-    void *getaddrinfoSymbol = xdl_sym(handle, "getaddrinfo", nullptr);
-    // libcore's InetAddress JNI calls this private Bionic entry point so that its
-    // selected Android netId/mark survive resolution.  Hooking getaddrinfo alone
-    // therefore does not cover ordinary Java hostname lookups.
-    void *networkSymbol = xdl_sym(handle, "android_getaddrinfofornet", nullptr);
-    bool resolverHooked = getaddrinfoSymbol &&
-            DobbyHook(getaddrinfoSymbol, reinterpret_cast<void *>(hookedGetAddrInfo),
-                      reinterpret_cast<void **>(&originalGetAddrInfo)) == 0 && originalGetAddrInfo;
-    bool networkHooked = networkSymbol &&
-            DobbyHook(networkSymbol, reinterpret_cast<void *>(hookedAndroidGetAddrInfoForNet),
-                      reinterpret_cast<void **>(&originalAndroidGetAddrInfoForNet)) == 0 &&
-            originalAndroidGetAddrInfoForNet;
-    if (!resolverHooked || !networkHooked) {
-        ALOGE("NetworkHook: requested guest resolver hooks could not be installed; terminating guest");
-        xdl_close(handle);
-        abort();
-    }
-    ALOGD("NetworkHook: guest resolver hooks installed (getaddrinfo + network-aware)");
     xdl_close(handle);
 }
