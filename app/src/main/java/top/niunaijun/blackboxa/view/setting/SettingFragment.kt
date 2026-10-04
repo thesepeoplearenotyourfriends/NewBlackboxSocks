@@ -1,6 +1,9 @@
 package top.niunaijun.blackboxa.view.setting
 
 import android.os.Bundle
+import android.text.InputType
+import android.text.method.PasswordTransformationMethod
+import androidx.preference.EditTextPreference
 import androidx.preference.Preference
 import androidx.preference.PreferenceFragmentCompat
 import top.niunaijun.blackbox.BlackBoxCore
@@ -12,7 +15,16 @@ import top.niunaijun.blackboxa.view.gms.GmsManagerActivity
 class SettingFragment : PreferenceFragmentCompat() {
 
     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+        // Match AppSharedPreferenceDelegate so the guest bootstrap can snapshot SOCKS settings.
+        preferenceManager.sharedPreferencesName = "AppSharedPreferenceDelegate"
         setPreferencesFromResource(R.xml.setting, rootKey)
+
+        findPreference<EditTextPreference>("mSocksPassword")
+                ?.setOnBindEditTextListener { editText ->
+                    editText.inputType =
+                            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                    editText.transformationMethod = PasswordTransformationMethod.getInstance()
+                }
 
         initGms()
 

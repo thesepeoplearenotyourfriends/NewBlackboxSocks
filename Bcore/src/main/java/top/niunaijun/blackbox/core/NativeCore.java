@@ -2,6 +2,8 @@ package top.niunaijun.blackbox.core;
 
 
 import android.os.Process;
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.util.Log;
 
 import androidx.annotation.Keep;
@@ -26,7 +28,28 @@ public class NativeCore {
         System.loadLibrary("blackbox");
     }
 
-    public static native void init(int apiLevel);
+    private static native void initNative(int apiLevel, boolean guest, boolean enabled,
+                                          String host, int port, String user, String password);
+
+    /** Snapshot host settings once. Native connect interception performs no JNI or preference I/O. */
+    public static void init(int apiLevel) {
+        boolean guest = BlackBoxCore.get().isBlackProcess();
+        SharedPreferences preferences = BlackBoxCore.getContext().getSharedPreferences(
+                "AppSharedPreferenceDelegate", Context.MODE_PRIVATE);
+        initNative(apiLevel, guest, preferences.getBoolean("mSocksEnabled", false),
+                preferences.getString("mSocksHost", "127.0.0.1"),
+                parsePort(preferences.getString("mSocksPort", "1080")),
+                preferences.getString("mSocksUser", ""),
+                preferences.getString("mSocksPassword", ""));
+    }
+
+    private static int parsePort(String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
+    }
 
     public static native void enableIO();
 
