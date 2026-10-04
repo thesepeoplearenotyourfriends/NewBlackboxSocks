@@ -3,6 +3,9 @@ package top.niunaijun.blackbox.fake.service.libcore;
 import android.os.Process;
 
 import java.lang.reflect.Method;
+import java.util.Collections;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import black.libcore.io.BRLibcore;
 import top.niunaijun.blackbox.BlackBoxCore;
@@ -17,6 +20,8 @@ import top.niunaijun.blackbox.utils.Reflector;
 public class OsStub extends ClassInvocationStub {
     public static final String TAG = "OsStub";
     private Object mBase;
+    private static final Set<String> sLoggedNetworkMethods =
+            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
     public OsStub() {
         mBase = BRLibcore.get().os();
@@ -43,6 +48,13 @@ public class OsStub extends ClassInvocationStub {
 
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        String name = method.getName();
+        if (isNetworkMethod(name) && sLoggedNetworkMethods.add(name)) {
+            // These calls deliberately delegate to Bionic. NetworkHook is the single
+            // implementation of SOCKS, fake-IP, UDP and fail-closed policy for both
+            // libcore and native callers.
+            android.util.Log.d(TAG, "NetworkPolicy: libcore Os path=" + name + " -> native policy");
+        }
         if (args != null) {
             for (int i = 0; i < args.length; i++) {
                 if (args[i] == null)
@@ -57,6 +69,14 @@ public class OsStub extends ClassInvocationStub {
             }
         }
         return super.invoke(proxy, method, args);
+    }
+
+    private static boolean isNetworkMethod(String name) {
+        return name.equals("socket") || name.equals("connect") || name.equals("sendto") ||
+                name.equals("sendmsg") || name.equals("recvfrom") || name.equals("recvmsg") ||
+                name.equals("poll") || name.equals("getsockoptInt") || name.equals("setsockoptInt") ||
+                name.equals("android_getaddrinfo") || name.equals("getaddrinfo") ||
+                name.equals("bind") || name.equals("listen") || name.equals("accept");
     }
 
     @ProxyMethod("getuid")
