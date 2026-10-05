@@ -26,6 +26,7 @@ dependencyResolutionManagement {
 rootProject.name = "NewBlackbox"
 
 include ':app'
+include ':webviewprobe'
 include(":black-reflection")
 include(":compiler")
 include ':Bcore'
