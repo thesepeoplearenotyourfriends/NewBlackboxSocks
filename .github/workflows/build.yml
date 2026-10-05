@@ -54,6 +54,24 @@ jobs:
           path: ${{ steps.apk.outputs.path }}
           if-no-files-found: error
 
+      - name: Find WebViewProbe performance APK
+        id: probe_apk
+        run: |
+          mapfile -t apks < <(find webviewprobe/build/outputs/apk/performance -maxdepth 1 -type f -name '*.apk' -print | sort)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "Expected exactly one WebViewProbe performance APK; found ${#apks[@]}:"
+            printf '  %s\n' "${apks[@]}"
+            exit 1
+          fi
+          echo "path=${apks[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload WebViewProbe performance APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebViewProbe-performance-APK
+          path: ${{ steps.probe_apk.outputs.path }}
+          if-no-files-found: error
+
       - name: Prepare release APK
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         run: cp "${{ steps.apk.outputs.path }}" NewBlackboxSocks.apk

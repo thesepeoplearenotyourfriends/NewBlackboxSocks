@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Local WebViewProbe</title></head>
+<body><h2>Local WebViewProbe page</h2><p>This page is bundled in the APK and loads no remote resources.</p>
+<div id="result"></div>
+<script>
+function note(value) { document.getElementById('result').textContent = value; console.log('WVPROBE_JS ' + value); }
+function goLocation(u) { note('location requested'); window.location.assign(u); }
+function doFetch(u) { note('fetch requested'); fetch(u, {cache:'no-store'}).then(function(r){ note('fetch status ' + r.status); }).catch(function(e){ note('fetch failed ' + e.name); }); }
+function doXhr(u) { note('xhr requested'); var x=new XMLHttpRequest(); x.open('GET',u); x.onload=function(){note('xhr status '+x.status);}; x.onerror=function(){note('xhr failed');}; x.send(); }
+function addImg(u) { note('img requested'); var x=new Image(); x.onload=function(){note('img loaded');}; x.onerror=function(){note('img failed');}; x.src=u; document.body.appendChild(x); }
+function addFrame(u) { note('iframe requested'); var x=document.createElement('iframe'); x.src=u; document.body.appendChild(x); }
+function submitForm(u, method) { note('form '+method+' requested'); var f=document.createElement('form'); f.action=u; f.method=method; var i=document.createElement('input'); i.name='webviewprobe'; i.value='1'; f.appendChild(i); document.body.appendChild(f); f.submit(); }
+</script></body></html>
