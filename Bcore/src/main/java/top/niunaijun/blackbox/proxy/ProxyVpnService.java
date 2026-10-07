@@ -16,12 +16,18 @@ public class ProxyVpnService extends VpnService {
     private static final String TAG = "NBSVpn";
     private static final int NOTIFICATION_ID = 1001;
     private static final String CHANNEL_ID = "BlackBoxVPN";
+    // Manifest keeps the VPN and Settings in the host's default process. Each
+    // service owns its counters; late workers cannot contaminate a new instance.
+    private static volatile NetworkDiagnostics currentDiagnostics = new NetworkDiagnostics();
+    private NetworkDiagnostics diagnostics;
     private ParcelFileDescriptor mVpnInterface;
     private VpnRelay relay;
     private boolean destroyed;
 
     @Override public void onCreate() {
         super.onCreate();
+        diagnostics = new NetworkDiagnostics();
+        currentDiagnostics = diagnostics;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "BlackBox VPN Service", NotificationManager.IMPORTANCE_LOW);
             channel.setShowBadge(false);
@@ -42,6 +48,7 @@ public class ProxyVpnService extends VpnService {
             else startForeground(NOTIFICATION_ID, built);
             establishVpn();
         } catch (Exception failure) {
+            diagnostics.failure(NetworkDiagnostics.FailureStage.VPN_START);
             Log.e(TAG, "vpn_failure stage=start");
             return START_NOT_STICKY;
         }
@@ -50,6 +57,7 @@ public class ProxyVpnService extends VpnService {
 
     protected synchronized void establishVpn() {
         if (destroyed || mVpnInterface != null) return;
+        NetworkDiagnostics.FailureStage stage = NetworkDiagnostics.FailureStage.VPN_ESTABLISH;
         try {
             Builder builder = new Builder().setSession("BlackBox authorized SOCKS networking").setMtu(1500);
             builder.addAddress("10.0.0.2", 32).addRoute("0.0.0.0", 0);
@@ -59,7 +67,12 @@ public class ProxyVpnService extends VpnService {
             builder.addAllowedApplication(getPackageName());
             builder.setBlocking(false);
             mVpnInterface = builder.establish();
-            if (mVpnInterface == null) { Log.e(TAG, "vpn_failure stage=establish"); return; }
+            if (mVpnInterface == null) {
+                diagnostics.failure(NetworkDiagnostics.FailureStage.VPN_ESTABLISH);
+                Log.e(TAG, "vpn_failure stage=establish"); return;
+            }
+            diagnostics.vpnActive(true);
+            stage = NetworkDiagnostics.FailureStage.SETUP_DENY_ALL;
             SharedPreferences settings = getSharedPreferences("AppSharedPreferenceDelegate", MODE_PRIVATE);
             int address = numericAddress(settings.getString("mSocksHost", "127.0.0.1"));
             int port;
@@ -68,10 +81,12 @@ public class ProxyVpnService extends VpnService {
             boolean configured = settings.getBoolean("mSocksEnabled", false) && address != 0 && port > 0 && port <= 65535
                     && settings.getString("mSocksUser", "").getBytes(StandardCharsets.UTF_8).length <= 255
                     && settings.getString("mSocksPassword", "").getBytes(StandardCharsets.UTF_8).length <= 255;
-            relay = new VpnRelay(this, mVpnInterface, getFilesDir(), address, port, configured);
+            relay = new VpnRelay(this, mVpnInterface, getFilesDir(), address, port, configured, diagnostics);
         } catch (Exception failure) {
             // Preserve any established interface on failure: a stopped relay is
             // deny-all containment, never a reason to restore a direct route.
+            diagnostics.relayActive(false);
+            diagnostics.failure(stage);
             Log.e(TAG, "vpn_failure stage=setup-deny-all");
         }
     }
@@ -96,12 +111,16 @@ public class ProxyVpnService extends VpnService {
     }
 
     private synchronized void stopVpn() {
+        diagnostics.relayActive(false);
         if (relay != null) { relay.close(); relay = null; }
         if (mVpnInterface != null) {
             try { mVpnInterface.close(); } catch (Exception ignored) { }
             mVpnInterface = null;
         }
+        diagnostics.vpnActive(false);
     }
+    public static NetworkDiagnostics.Snapshot getDiagnosticsSnapshot() { return currentDiagnostics.snapshot(); }
+    public static void resetDiagnostics() { currentDiagnostics.reset(); }
     public synchronized boolean isEstablished() { return mVpnInterface != null; }
     public synchronized ParcelFileDescriptor getVpnInterface() { return mVpnInterface; }
     @Override public synchronized void onDestroy() { destroyed = true; stopVpn(); super.onDestroy(); }
