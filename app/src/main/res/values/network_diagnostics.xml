@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="network_diagnostics">Network Diagnostics</string>
+    <string name="network_diagnostics_summary">Current VPN state and aggregate rejection counters</string>
+    <string name="network_diagnostics_privacy">Refreshes while this screen is open. Only aggregate counters and internal failure stages are shown. No browsing history, addresses, credentials or packet contents. Reset clears counters without changing networking.</string>
+    <string name="copy_network_diagnostics">Copy diagnostics</string>
+    <string name="reset_network_diagnostics">Reset diagnostics</string>
+    <string name="network_diagnostics_reset_done">Diagnostics reset</string>
+    <string name="network_diagnostics_copied">Diagnostics copied</string>
+</resources>

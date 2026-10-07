@@ -52,6 +52,11 @@
                 app:title="@string/use_vpn_network"
                 app:summary="@string/use_vpn_network_summary" />
 
+        <Preference
+                app:key="network_diagnostics"
+                app:title="@string/network_diagnostics"
+                app:summary="@string/network_diagnostics_summary" />
+
         <SwitchPreferenceCompat
                 app:key="disable_flag_secure"
                 app:title="@string/disable_flag_secure"

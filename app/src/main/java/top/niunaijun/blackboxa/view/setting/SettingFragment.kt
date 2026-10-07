@@ -1,5 +1,6 @@
 package top.niunaijun.blackboxa.view.setting
 
+import android.content.Intent
 import android.os.Bundle
 import android.text.InputType
 import android.text.method.PasswordTransformationMethod
@@ -18,6 +19,10 @@ class SettingFragment : PreferenceFragmentCompat() {
         // Match AppSharedPreferenceDelegate so the guest bootstrap can snapshot SOCKS settings.
         preferenceManager.sharedPreferencesName = "AppSharedPreferenceDelegate"
         setPreferencesFromResource(R.xml.setting, rootKey)
+        findPreference<Preference>("network_diagnostics")?.setOnPreferenceClickListener {
+            startActivity(Intent(requireContext(), NetworkDiagnosticsActivity::class.java))
+            true
+        }
 
         findPreference<EditTextPreference>("mSocksPassword")
                 ?.setOnBindEditTextListener { editText ->

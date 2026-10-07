@@ -30,6 +30,9 @@ import java.util.concurrent.Semaphore;
 
 import top.niunaijun.blackbox.core.NativeCore;
 
+import static top.niunaijun.blackbox.proxy.NetworkDiagnostics.Counter.*;
+import static top.niunaijun.blackbox.proxy.NetworkDiagnostics.TcpDrop;
+
 /** Private capability broker. No exported Binder/service or abstract socket name. */
 final class VpnFlowRegistry implements AutoCloseable {
     static final int MAX_FLOWS = 128;
@@ -43,7 +46,7 @@ final class VpnFlowRegistry implements AutoCloseable {
     private final LocalServerSocket server;
     private final File path;
     private final int proxyAddress, proxyPort;
-    private final VpnRelay.Diagnostics diagnostics;
+    private final NetworkDiagnostics diagnostics;
     private volatile boolean running = true;
 
     private static int exclusiveSocketType(FileDescriptor fd) throws IOException {
@@ -87,7 +90,7 @@ final class VpnFlowRegistry implements AutoCloseable {
         Flow(Key key, LocalSocket owner, Flow control) { this.key = key; this.owner = owner; this.control = control; }
     }
 
-    VpnFlowRegistry(File directory, int proxyAddress, int proxyPort, VpnRelay.Diagnostics diagnostics) throws IOException {
+    VpnFlowRegistry(File directory, int proxyAddress, int proxyPort, NetworkDiagnostics diagnostics) throws IOException {
         this.proxyAddress = proxyAddress; this.proxyPort = proxyPort; this.diagnostics = diagnostics;
         path = new File(directory, "nbs-flow.sock");
         // The service is a singleton. A stale filesystem name grants no capability.
@@ -111,14 +114,14 @@ final class VpnFlowRegistry implements AutoCloseable {
         while (running) {
             try {
                 LocalSocket channel = server.accept();
-                if (!slots.tryAcquire()) { diagnostics.registrationFailure.incrementAndGet(); channel.close(); continue; }
+                if (!slots.tryAcquire()) { diagnostics.increment(REGISTRATION_FAILED); channel.close(); continue; }
                 synchronized (this) {
                     if (!running) { slots.release(); channel.close(); break; }
                     channels.add(channel);
                 }
                 new Thread(() -> serve(channel), "NBSFlowLease").start();
             } catch (IOException failure) {
-                if (running) diagnostics.registrationFailure.incrementAndGet();
+                if (running) diagnostics.increment(REGISTRATION_FAILED);
                 break;
             }
         }
@@ -128,11 +131,11 @@ final class VpnFlowRegistry implements AutoCloseable {
         int sourcePort = 0, socketType = 0;
         Flow control = null;
         long channelExpiry = SystemClock.elapsedRealtime() + MAX_LIFETIME_MS;
+        boolean first = true;
         try {
             if (channel.getPeerCredentials().getUid() != Process.myUid()) throw new IOException("peer");
             channel.setSoTimeout(2_000);
             DataInputStream input = new DataInputStream(channel.getInputStream());
-            boolean first = true;
             while (running) {
                 // Waiting for the next command is bounded by the hard lease lifetime.
                 channel.setSoTimeout(first ? 2_000 : (int) Math.max(1, channelExpiry - SystemClock.elapsedRealtime()));
@@ -187,7 +190,7 @@ final class VpnFlowRegistry implements AutoCloseable {
                     } else throw new IOException("protocol");
                     register(new Key(protocol, sourcePort, address, port), channel, header, control);
                     channel.getOutputStream().write(1);
-                    diagnostics.registered.incrementAndGet();
+                    diagnostics.increment(REGISTERED);
                     first = false;
                 } finally {
                     // Never keep a reference to the guest socket: doing so would
@@ -198,9 +201,10 @@ final class VpnFlowRegistry implements AutoCloseable {
         } catch (EOFException closed) {
             // Normal socket closure/death revokes; it is not registration failure.
         } catch (SocketTimeoutException expired) {
-            if (running) diagnostics.expired.incrementAndGet();
+            // Record invalidated flow records once in finally, not channel timeouts.
+            if (running && first) diagnostics.increment(REGISTRATION_FAILED);
         } catch (Exception failure) {
-            if (running) diagnostics.registrationFailure.incrementAndGet();
+            if (running) diagnostics.increment(REGISTRATION_FAILED);
         } finally {
             // Also collect descriptors received with a truncated/aborted request.
             // SCM_RIGHTS must never turn malformed IPC into a descriptor leak.
@@ -212,7 +216,7 @@ final class VpnFlowRegistry implements AutoCloseable {
                 channels.remove(channel);
                 for (Iterator<Flow> it = flows.values().iterator(); it.hasNext();) {
                     Flow flow = it.next();
-                    if (flow.owner == channel) { flow.revoked = true; it.remove(); }
+                    if (flow.owner == channel) { revoke(flow); it.remove(); }
                 }
             }
             try { channel.close(); } catch (IOException ignored) { }
@@ -260,18 +264,32 @@ final class VpnFlowRegistry implements AutoCloseable {
 
     synchronized Flow authorizeTcp(Key key, boolean syn, int sequence) {
         Flow flow = flows.get(key);
-        if (!live(flow)) return null;
+        if (flow == null) {
+            // This is a lookup against the current bounded registry, not packet history.
+            // The descriptor-derived source port links a retained registration even
+            // when its destination tuple differs. It still grants no authorization.
+            boolean registeredSourcePort = false;
+            for (Flow candidate : flows.values()) {
+                if (candidate.key.protocol == 6 && candidate.key.sourcePort == key.sourcePort) {
+                    registeredSourcePort = true; break;
+                }
+            }
+            diagnostics.dropTcp(VpnTcpDecision.missingTuple(registeredSourcePort));
+            return null;
+        }
+        TcpDrop rejection = VpnTcpDecision.validate(live(flow), flow.active, syn, flow.initialSequence, sequence);
+        if (rejection != null) { diagnostics.dropTcp(rejection); return null; }
         if (!flow.active) {
-            if (!syn) return null;
             flow.active = true; flow.initialSequence = sequence;
-        } else if (syn && flow.initialSequence != sequence) return null;
+            diagnostics.increment(TCP_FIRST_SYN);
+        }
         flow.lastActivity = SystemClock.elapsedRealtime();
         return flow;
     }
 
     synchronized Flow authorizeUdp(Key key, byte[] packet, int offset, int length) {
         Flow flow = flows.get(key);
-        if (!live(flow)) return null;
+        if (!live(flow)) { diagnostics.increment(UDP_DROPPED); return null; }
         pruneTickets(flow);
         for (Iterator<Ticket> it = flow.tickets.iterator(); it.hasNext();) {
             Ticket ticket = it.next();
@@ -280,6 +298,7 @@ final class VpnFlowRegistry implements AutoCloseable {
             for (int i = 0; i < ticket.header.length; i++) if (packet[offset + i] != ticket.header[i]) { match = false; break; }
             if (match) { it.remove(); flow.active = true; touch(flow); return flow; }
         }
+        diagnostics.increment(UDP_DROPPED);
         return null;
     }
 
@@ -313,21 +332,25 @@ final class VpnFlowRegistry implements AutoCloseable {
     private void pruneTickets(Flow flow) {
         long now = SystemClock.elapsedRealtime();
         while (!flow.tickets.isEmpty() && flow.tickets.peekFirst().expires <= now) {
-            flow.tickets.removeFirst(); diagnostics.ticketExpiry.incrementAndGet();
+            flow.tickets.removeFirst(); diagnostics.increment(UDP_TICKET_EXPIRED);
         }
     }
 
     synchronized void expire() {
         for (Iterator<Flow> it = flows.values().iterator(); it.hasNext();) {
             Flow flow = it.next(); pruneTickets(flow);
-            if (!live(flow)) { flow.revoked = true; it.remove(); diagnostics.expired.incrementAndGet(); }
+            if (!live(flow)) { revoke(flow); it.remove(); }
         }
+    }
+
+    private void revoke(Flow flow) {
+        if (!flow.revoked) { flow.revoked = true; diagnostics.increment(REGISTRATION_ENDED); }
     }
 
     @Override public void close() {
         running = false;
         synchronized (this) {
-            for (Flow flow : flows.values()) flow.revoked = true;
+            for (Flow flow : flows.values()) revoke(flow);
             flows.clear();
             for (LocalSocket channel : new ArrayList<>(channels)) try { channel.close(); } catch (IOException ignored) { }
         }

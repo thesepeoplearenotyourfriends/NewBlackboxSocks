@@ -75,13 +75,75 @@ configuration snapshots agree; the broker rejects mismatched TCP endpoints.
 
 ## Diagnostics and device validation
 
-`NBSVpn` reports aggregate counters every thirty seconds and at shutdown:
-authorized TCP/UDP flows, forwarded packets, TCP/UDP/other drops, registrations,
-registration failures, expired records/tickets and relay failures. Flow counters
-mean an onward socket connected or a UDP datagram was sent; they do not assert
-SOCKS authentication success or application success. `NetworkHook` reports
-bounded SOCKS negotiation/authentication failure stages. None of these logs
-contains addresses, credentials, hostnames, URLs, payloads or flow tuples.
+Open **Settings → Network Diagnostics** in NBS. The screen refreshes once per
+second while visible and shows the host-process VPN instance's aggregate
+counters. **Copy diagnostics** puts a fresh plaintext snapshot on the clipboard;
+**Reset diagnostics** clears counters and the last failure stage atomically,
+without changing settings, registrations, SYN generations, tickets or sockets.
+Each VPN service creation starts a fresh diagnostics instance. Stop/revoke marks
+the VPN and relay inactive; the previous aggregates remain visible until reset,
+service recreation or host-process restart. Late workers retain their own
+instance and cannot update a newly created VPN's counters. SOCKS enabled is
+explicitly the current Settings value, not a claim that running guests have
+reloaded those settings.
+
+TCP drops are classified at their existing rejection decisions:
+
+- **No retained registration:** no exact tuple and no retained TCP registration
+  with the packet's source port.
+- **Tuple mismatch (registered source port):** no exact tuple, but the bounded
+  current registry contains a TCP registration with that source port. This is
+  diagnostic evidence only and never authorizes the different tuple.
+- **Expired/revoked:** the exact retained record (or local reply's known flow)
+  fails the existing lease/channel/control liveness test.
+- **SYN/generation mismatch:** invalid SYN flags, a first packet without the
+  required SYN, or a new SYN sequence on an active registration.
+- **Malformed/unsupported:** bad lengths/checksums, IP options/fragments, or
+  unsupported IP versions when the TCP protocol can be identified. IPv6 with
+  an immediate TCP next-header is classified here; extension chains and packets
+  too short to identify a protocol remain in other/unclassifiable drops.
+- **Source/address policy:** a guest-side TCP packet has a source different from
+  the VPN's required address.
+- **Other policy:** unavailable registry/relay, missing local-reply connection,
+  conflicting live relay generation or a stopped TUN writer.
+
+There are no tombstones or per-flow histories. Once cleanup removes a revoked
+record, later packets can count as **no retained registration**; that cannot prove
+the socket was never registered. The screen says this explicitly and separately
+counts expired/revoked records, once per record (including guest close and VPN
+shutdown). Accepted registrations count acknowledged requests, including UDP
+send tickets. Failed registrations count rejected requests/channels, including
+timeout before the first accepted request. Local TCP listener rejections count
+connections separately, not TUN packet drops.
+
+Accepted first SYNs help distinguish passing the gate from reaching the onward
+socket. Authorized TCP flows mean an onward socket connected; authorized UDP
+flows mean the first datagram was sent. Forwarded packet counters count the
+guest-to-relay direction; TCP rewrite-to-TUN success and UDP socket send success
+respectively. UDP drops cover both directions, including ticket rejection,
+malformed traffic, invalid/oversized replies and failed outbound sends. Expired
+UDP tickets count tickets pruned at their existing expiration points. None of
+these counters asserts SOCKS authentication or browsing success.
+
+All counters saturate at `Long.MAX_VALUE`; increments, TCP category/total pairs,
+failure stages, reset and snapshots are synchronized. State is process-local and
+contains only fixed counters, flags and an allowlisted failure-stage enum. No
+addresses, credentials, hostnames, URLs, payloads, packets or flow tuples enter
+the UI, clipboard summary or this diagnostics store. `NBSVpn` keeps aggregate
+logcat reporting every thirty seconds and at shutdown. `NetworkHook` continues
+its existing bounded SOCKS negotiation/authentication failure reporting.
+
+Focused host checks: `bash tests/run-network-diagnostics-tests.sh` exercises the
+actual registry classification helpers, generation acceptance/rejection, reset,
+immutable snapshots, concurrent category/total accounting and saturation. It
+does not exercise Android kernel descriptor checks or actual packet forwarding.
+
+For the Via reproduction, keep **NBS → socksbridge.py → 3proxy:1080**, enable VPN,
+optionally reset diagnostics immediately before the attempt, launch Via, attempt
+one URL, then return to Network Diagnostics. Inspect first SYNs, the TCP rejection
+categories and the last relay failure stage before considering routing changes.
+This instrumentation does not change authorization policy, SOCKS behavior or
+proxy topology and does not claim to fix Via.
 
 Device checks should exercise authenticated TCP with numeric and fake-IP
 destinations, authentication refusal/downgrade rejection, UDP numeric/DOMAIN
