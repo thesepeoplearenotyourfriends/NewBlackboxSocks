@@ -88,7 +88,8 @@ void hideXposed(JNIEnv *env, jclass clazz) {
 }
 
 void init(JNIEnv *env, jobject clazz, jint api_level, jboolean guest, jboolean socksEnabled,
-          jstring socksHost, jint socksPort, jstring socksUser, jstring socksPassword) {
+          jstring socksHost, jint socksPort, jstring socksUser, jstring socksPassword,
+          jstring flowSocketPath) {
     ALOGD("NativeCore init.");
     VMEnv.api_level = api_level;
     VMEnv.NativeCoreClass = (jclass) env->NewGlobalRef(env->FindClass(VMCORE_CLASS));
@@ -99,7 +100,8 @@ void init(JNIEnv *env, jobject clazz, jint api_level, jboolean guest, jboolean s
                                                     "(Ljava/io/File;)Ljava/io/File;");
     VMEnv.loadEmptyDex = env->GetStaticMethodID(VMEnv.NativeCoreClass, "loadEmptyDex",
                                                 "()[J");
-    NetworkHook::configure(env, guest && socksEnabled, socksHost, socksPort, socksUser, socksPassword);
+    NetworkHook::configure(env, guest && socksEnabled, socksHost, socksPort, socksUser, socksPassword,
+                           flowSocketPath);
 
     JniHook::InitJniHook(env, api_level);
 }
@@ -141,7 +143,7 @@ static JNINativeMethod gMethods[] = {
         {"hideXposed", "()V",                                     (void *) hideXposed},
         {"addIORule",  "(Ljava/lang/String;Ljava/lang/String;)V", (void *) addIORule},
         {"enableIO",   "()V",                                     (void *) enableIO},
-        {"initNative", "(IZZLjava/lang/String;ILjava/lang/String;Ljava/lang/String;)V", (void *) init},
+        {"initNative", "(IZZLjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", (void *) init},
 };
 
 int registerNativeMethods(JNIEnv *env, const char *className,

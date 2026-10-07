@@ -1680,6 +1680,10 @@ public class BlackBoxCore extends ClientConfiguration {
     }
     
     
+    public boolean isUseVpnNetwork() {
+        return mClientConfiguration != null && mClientConfiguration.isUseVpnNetwork();
+    }
+
     private void initVpnService() {
         try {
             
