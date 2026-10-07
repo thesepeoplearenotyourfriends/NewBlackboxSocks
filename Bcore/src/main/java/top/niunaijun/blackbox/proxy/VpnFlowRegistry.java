@@ -4,6 +4,7 @@ import android.net.LocalServerSocket;
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
 import android.os.Process;
+import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.system.Os;
 import android.system.OsConstants;
@@ -27,6 +28,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
 
+import top.niunaijun.blackbox.core.NativeCore;
+
 /** Private capability broker. No exported Binder/service or abstract socket name. */
 final class VpnFlowRegistry implements AutoCloseable {
     static final int MAX_FLOWS = 128;
@@ -42,6 +45,16 @@ final class VpnFlowRegistry implements AutoCloseable {
     private final int proxyAddress, proxyPort;
     private final VpnRelay.Diagnostics diagnostics;
     private volatile boolean running = true;
+
+    private static int exclusiveSocketType(FileDescriptor fd) throws IOException {
+        // Public SDK APIs expose the raw descriptor through a temporary duplicate.
+        // Close it immediately so inspection cannot extend the guest socket lease.
+        try (ParcelFileDescriptor duplicate = ParcelFileDescriptor.dup(fd)) {
+            int type = NativeCore.getExclusiveSocketType(duplicate.getFd());
+            if (type < 0) throw new IOException("socket-options");
+            return type;
+        }
+    }
 
     static final class Key {
         final int protocol, sourcePort, address, port;
@@ -142,11 +155,7 @@ final class VpnFlowRegistry implements AutoCloseable {
                         if (!localAddress(endpoint) || endpoint.getPort() == 0)
                             throw new IOException("source");
                         sourcePort = endpoint.getPort();
-                        socketType = Os.getsockoptInt(fd, OsConstants.SOL_SOCKET, OsConstants.SO_TYPE);
-                        if (socketType == OsConstants.SOCK_DGRAM &&
-                                (Os.getsockoptInt(fd, OsConstants.SOL_SOCKET, OsConstants.SO_REUSEADDR) != 0 ||
-                                 Os.getsockoptInt(fd, OsConstants.SOL_SOCKET, OsConstants.SO_REUSEPORT) != 0))
-                            throw new IOException("shared-port");
+                        socketType = exclusiveSocketType(fd);
                         if (protocol == 17) {
                             FileDescriptor parentFd = descriptors[1];
                             SocketAddress parentAddress = Os.getsockname(parentFd);
@@ -155,7 +164,7 @@ final class VpnFlowRegistry implements AutoCloseable {
                                     !(parentPeer instanceof InetSocketAddress) ||
                                     ((InetSocketAddress) parentPeer).getPort() != proxyPort ||
                                     !Arrays.equals(normalizedAddress((InetSocketAddress) parentPeer), VpnRelay.bytes(proxyAddress)) ||
-                                    Os.getsockoptInt(parentFd, OsConstants.SOL_SOCKET, OsConstants.SO_TYPE) != OsConstants.SOCK_STREAM)
+                                    exclusiveSocketType(parentFd) != OsConstants.SOCK_STREAM)
                                 throw new IOException("udp-control");
                             synchronized (this) {
                                 control = flows.get(new Key(6, ((InetSocketAddress) parentAddress).getPort(), proxyAddress, proxyPort));

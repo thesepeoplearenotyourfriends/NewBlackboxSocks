@@ -6,6 +6,7 @@
 #include "Log.h"
 #include "IO.h"
 #include <jni.h>
+#include <sys/socket.h>
 #include <JniHook/JniHook.h>
 #include <Hook/VMClassLoaderHook.h>
 #include <Hook/UnixFileSystemHook.h>
@@ -137,7 +138,27 @@ bool disableResourceLoading(JNIEnv *env, jclass clazz) {
     return true;
 }
 
+static jint getExclusiveSocketType(JNIEnv *, jclass, jint fd) {
+    int type = 0;
+    socklen_t length = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) != 0 || length != sizeof(type))
+        return -1;
+    if (type == SOCK_STREAM) return type;
+    if (type != SOCK_DGRAM) return -1;
+    // These are NDK socket options, not public android.system Java SDK APIs.
+    const int options[] = {SO_REUSEADDR, SO_REUSEPORT};
+    for (int option : options) {
+        int enabled = 0;
+        length = sizeof(enabled);
+        if (getsockopt(fd, SOL_SOCKET, option, &enabled, &length) != 0 ||
+            length != sizeof(enabled) || enabled != 0)
+            return -1;
+    }
+    return type;
+}
+
 static JNINativeMethod gMethods[] = {
+        {"getExclusiveSocketType", "(I)I",                         (void *) getExclusiveSocketType},
         {"disableHiddenApi", "()Z",                               (void *) disableHiddenApi},
         {"disableResourceLoading", "()Z",                         (void *) disableResourceLoading},
         {"hideXposed", "()V",                                     (void *) hideXposed},

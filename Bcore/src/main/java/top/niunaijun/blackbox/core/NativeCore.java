@@ -57,6 +57,9 @@ public class NativeCore {
 
     public static native void enableIO();
 
+    /** Socket type, or -1 on inspection failure/unsupported type/reusable UDP port. */
+    public static native int getExclusiveSocketType(int fd);
+
     public static native void addIORule(String targetPath, String relocatePath);
 
     public static native void hideXposed();
