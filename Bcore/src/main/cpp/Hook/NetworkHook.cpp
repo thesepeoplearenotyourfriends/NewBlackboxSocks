@@ -1,3 +1,4 @@
+#include <chrono>
 #include "NetworkHook.h"
 
 #include "Dobby/dobby.h"
@@ -460,10 +461,16 @@ bool isFakeAddress(uint32_t networkAddress) {
     return (ntohl(networkAddress) & kFakeMask) == kFakeNetwork;
 }
 
+bool centralSyntheticAddress(const std::string &hostname, uint32_t *result);
+
 bool mappedHostname(uint32_t networkAddress, std::string *hostname) {
     std::lock_guard<std::mutex> lock(mappingsMutex);
     auto found = addressToHostname.find(networkAddress);
     if (found == addressToHostname.end()) return false;
+    if (!flowSocketPath.empty()) {
+        uint32_t current;
+        if (!centralSyntheticAddress(found->second, &current) || current != networkAddress) return false;
+    }
     *hostname = found->second;
     return true;
 }
@@ -496,6 +503,52 @@ bool isOrdinaryHostname(const char *node) {
            !(hostname.size() > 10 && hostname.compare(hostname.size() - 10, 10, ".localhost") == 0);
 }
 
+bool centralSyntheticAddress(const std::string &hostname, uint32_t *result) {
+    if (hostname.empty() || hostname.size() > 253) return false;
+    const size_t slash = flowSocketPath.find_last_of('/');
+    if (slash == std::string::npos) return false;
+    std::string path = flowSocketPath.substr(0, slash + 1) + "nbs-mapping.sock";
+    if (path.size() >= sizeof(sockaddr_un::sun_path)) return false;
+    int fd = static_cast<int>(syscall(SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+    if (fd < 0) return false;
+    // Poll all IPC against one monotonic deadline, including connect and trickle responses.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto wait = [&](short events) {
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) return false;
+        pollfd item{fd, events, 0};
+        return poll(&item, 1, static_cast<int>(left)) > 0 && (item.revents & events) &&
+               !(item.revents & (POLLERR | POLLNVAL));
+    };
+    sockaddr_un endpoint{}; endpoint.sun_family = AF_UNIX;
+    memcpy(endpoint.sun_path, path.c_str(), path.size() + 1);
+    bool ok = syscall(SYS_connect, fd, &endpoint, sizeof(endpoint)) == 0;
+    if (!ok && errno == EINPROGRESS && wait(POLLOUT)) {
+        int error = 0; socklen_t length = sizeof(error);
+        ok = getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0;
+    }
+    ucred credentials{}; socklen_t length = sizeof(credentials);
+    ok = ok && getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length) == 0 && credentials.uid == geteuid();
+    std::vector<uint8_t> request{'N', 'B', 'M', 1, static_cast<uint8_t>(hostname.size() >> 8), static_cast<uint8_t>(hostname.size())};
+    request.insert(request.end(), hostname.begin(), hostname.end());
+    size_t offset = 0;
+    while (ok && offset < request.size()) {
+        if (!wait(POLLOUT)) { ok = false; break; }
+        ssize_t count = syscall(SYS_sendto, fd, request.data() + offset, request.size() - offset, MSG_NOSIGNAL, nullptr, 0);
+        if (count <= 0) { ok = false; break; } offset += count;
+    }
+    uint8_t reply[8]{}; offset = 0;
+    while (ok && offset < sizeof(reply)) {
+        if (!wait(POLLIN)) { ok = false; break; }
+        ssize_t count = syscall(SYS_recvfrom, fd, reply + offset, sizeof(reply) - offset, 0, nullptr, nullptr);
+        if (count <= 0) { ok = false; break; } offset += count;
+    }
+    syscall(SYS_close, fd);
+    if (!ok || memcmp(reply, "NBM\1", 4) != 0) return false;
+    memcpy(result, reply + 4, 4);
+    return isFakeAddress(*result);
+}
+
 int syntheticAddress(const char *node, uint32_t *address) {
     std::string hostname(node);
     if (hostname.size() > 255) return EAI_NONAME;
@@ -503,6 +556,17 @@ int syntheticAddress(const char *node, uint32_t *address) {
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     while (hostname.size() > 1 && hostname.back() == '.') hostname.pop_back();
     std::lock_guard<std::mutex> lock(mappingsMutex);
+    if (!flowSocketPath.empty()) {
+        uint32_t candidate;
+        if (!centralSyntheticAddress(hostname, &candidate)) return EAI_AGAIN;
+        // Broker restart may issue a new address. Never retain an ambiguous old reverse mapping.
+        auto old = hostnameToAddress.find(hostname);
+        if (old != hostnameToAddress.end() && old->second != candidate) addressToHostname.erase(old->second);
+        auto collision = addressToHostname.find(candidate);
+        if (collision != addressToHostname.end() && collision->second != hostname) return EAI_FAIL;
+        hostnameToAddress[hostname] = candidate; addressToHostname[candidate] = hostname;
+        *address = candidate; return 0;
+    }
     auto existing = hostnameToAddress.find(hostname);
     if (existing != hostnameToAddress.end()) {
         *address = existing->second;

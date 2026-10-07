@@ -1,16 +1,16 @@
 # Selective VPN flow authorization
 
-The VPN is a second containment layer. Package membership, SYSTEM identity and
-arrival at its TUN do not grant forwarding permission. No Android deputies are
-exceptions. `addAllowedApplication(getPackageName())` remains the package scope.
+The VPN contains only NBS package traffic through
+`addAllowedApplication(getPackageName())`. Descriptor-backed native registrations
+remain the strongest path. Otherwise-unregistered TCP initial SYNs may use
+selective-TUN membership as fallback authority, subject to tuple/generation,
+packet, destination and mapping validation described below. UDP still requires
+explicit native registrations.
 
-The existing guest `NetworkHook` already translates TCP into SOCKS CONNECT and
-UDP into SOCKS UDP ASSOCIATE datagrams. The VPN therefore authorizes and relays
-those **SOCKS transport sockets**. It does not implement a second SOCKS client or
-wrap an existing SOCKS connection in another SOCKS connection. The guest native
-implementation still sends credentials, rejects authentication downgrade,
-encodes fake-IP destinations as SOCKS DOMAIN, and decodes UDP replies. No guest
-hostname mappings or credentials need to be copied into the VPN broker.
+Registered native transports retain their existing SOCKS stream without another
+CONNECT wrapper. Fallback transports perform SOCKS5 CONNECT in the VPN service,
+using the configured endpoint/authentication and the original IPv4 destination
+or a centrally allocated hostname mapping.
 
 ## Registration and lifetime
 
@@ -107,10 +107,10 @@ TCP drops are classified at their existing rejection decisions:
 - **Other policy:** unavailable registry/relay, missing local-reply connection,
   conflicting live relay generation or a stopped TUN writer.
 
-There are no tombstones or per-flow histories. Once cleanup removes a revoked
-record, later packets can count as **no retained registration**; that cannot prove
-the socket was never registered. The screen says this explicitly and separately
-counts expired/revoked records, once per record (including guest close and VPN
+Revoked native source ports and closed fallback generations are briefly
+quarantined. After quarantine cleanup, later packets can count as **no retained
+registration**; that cannot prove the socket was never registered. Diagnostics
+retain no per-flow history. The screen separately counts expired/revoked registrations, once per record (including guest close and VPN
 shutdown). Accepted registrations count acknowledged requests, including UDP
 send tickets. Failed registrations count rejected requests/channels, including
 timeout before the first accepted request. Local TCP listener rejections count
@@ -142,31 +142,75 @@ For the Via reproduction, keep **NBS → socksbridge.py → 3proxy:1080**, enabl
 optionally reset diagnostics immediately before the attempt, launch Via, attempt
 one URL, then return to Network Diagnostics. Inspect first SYNs, the TCP rejection
 categories and the last relay failure stage before considering routing changes.
-This instrumentation does not change authorization policy, SOCKS behavior or
-proxy topology and does not claim to fix Via.
+The fallback implementation below changes authorization for selective-TUN TCP
+and adds SOCKS forwarding. The external proxy topology remains unchanged.
 
 Device checks should exercise authenticated TCP with numeric and fake-IP
 destinations, authentication refusal/downgrade rejection, UDP numeric/DOMAIN
 traffic against a UDP-capable endpoint, ordinary unregistered TCP/UDP sockets,
 guest close/death and source-port reuse, idle/hard expiry, and VPN stop/restart.
-Verify counters and endpoint observations together. Android delegated networking
-is deliberately denied. Compilation or installed hooks are not runtime PASS.
+Verify counters and endpoint observations together. Android delegated TCP is
+eligible only when it arrives through the selective NBS TUN and passes the fallback gate. Compilation or installed hooks are not runtime PASS.
 
-### Unregistered TCP owner evidence
+### Selective-TUN TCP fallback
 
-At the existing no-retained-registration rejection, valid outgoing initial SYNs
-query Android 10+ `ConnectivityManager.getConnectionOwnerUid` with TCP and the
-exact unmodified VPN source/destination endpoints. The comparison uses the host
-process real `Process.myUid()`, shared by NBS/BlackBox guest subprocesses.
-The Settings screen and Copy diagnostics show only saturating aggregate counts:
-NBS UID, another UID, INVALID_UID/no owner, and unavailable/failed lookup. NBS
-results are split into synthetic fake-DNS IPv4 (198.18.0.0/15) and ordinary IPv4.
-These count SYN observations, including retransmissions, not unique flows.
-No tuples or owner UID values are retained by diagnostics. Unsupported APIs,
-exceptions and ownership races remain rejected, as do positively identified NBS
-misses. Registered authorization and normal bridge topology are unchanged.
+Descriptor-backed authorization remains first. For valid outgoing IPv4 initial
+SYNs from the VPN's exact source address, only `NO_REGISTRATION` may create a
+fallback. A retained native source-port registration with a different tuple,
+expired/revoked registration, invalid SYN generation, malformed packet, or
+address-policy rejection cannot grant fallback authority. The NBS-only
+`addAllowedApplication(getPackageName())` selection supplies fallback provenance;
+there is no framework connection-owner lookup.
 
-Device follow-up: keep NBS → socksbridge.py → 3proxy:1080, reset diagnostics,
-reproduce once in Via, and inspect/copy the owner categories and destination-kind
-counts. Framework ownership accuracy and races, API fallback, clipboard/UI,
-and continued fail-closed packet handling require device validation.
+Fallback records bind the original tuple and SYN sequence. Retransmissions reuse
+the record; a different tuple or sequence is rejected. Closed/expired fallback
+records and revoked native ports are quarantined for 120 seconds. Each relay
+connection receives a distinct, never-recycled kernel listener source-port alias
+for the service lifetime, so delayed listener packets/accepts cannot attach to a
+new generation. Alias or flow capacity exhaustion fails closed. Native registrations
+still carry their unchanged SOCKS byte stream to the registered endpoint.
+
+Fallback uses the existing local kernel TCP listener and byte pumps. Its outward
+socket is protected before connecting to the configured SOCKS endpoint. It then
+performs SOCKS5 CONNECT: ATYP IPv4 for the exact ordinary destination, or ATYP
+DOMAIN for an exact active synthetic mapping. Authentication settings offer only
+RFC1929; no-auth is offered only without credentials. Connect and negotiation each
+have a ten-second bound, including a total negotiation deadline. Malformed replies,
+missing mappings, protect/connect failures and shutdown close the transport; there
+is no direct-network retry. The external topology remains NBS -> socksbridge.py ->
+3proxy:1080. UDP continues to require the existing native registration/ticket path.
+
+In VPN/flow-broker mode, native resolver allocation and reverse-mapping validation
+use `files/nbs-mapping.sock`, a mode-0600 filesystem AF_UNIX endpoint. Both ends
+verify the real NBS UID. The protocol is versioned, ASCII hostname requests are
+bounded to 253 bytes, labels are validated, requests time out, and concurrent
+clients share one synchronized hostname allocator. Names normalize to lowercase
+with an optional trailing dot removed. Repeated names get stable mappings; distinct
+names get distinct addresses from 198.18/15. Unknown synthetic addresses are never
+sent upstream. Broker failure does not restore per-process allocation. Without VPN
+mode, the original process-local native SOCKS/fake-DNS implementation remains.
+
+Mappings are memory-only and are cleared at shutdown. A private, numeric-only
+`nbs-mapping-cursor` high-water mark is synced before issuing an address; it stores
+no hostname or reverse mapping. It prevents cached guest synthetic addresses from
+aliasing new names even after host/service process death. Addresses are never
+recycled until app data is cleared; exhaustion or corrupt cursor storage fails
+closed. Unused addresses consumed by a crash remain reserved. Filesystem socket
+names and active clients are cleaned up at startup/shutdown. Diagnostics contain
+only aggregate accepted/connected, IPv4/DOMAIN, mapping-miss and failure counts.
+
+Host checks: `tests/run-network-diagnostics-tests.sh`,
+`tests/run-vpn-fallback-tests.sh`, and `python3 tests/run-native-mapping-tests.py`.
+The registry checks run production authorization with explicit Android boundary
+stubs; they do not claim Android IPC or TUN validation. Native mapping checks
+exercise extracted production IPC/allocator functions against real host AF_UNIX.
+The SOCKS transport check exchanges bytes with a host mock SOCKS endpoint and
+checks protection before connect; actual Android `VpnService.protect` is device-only.
+
+Next device validation: install the performance arm64 APK, restart guests, enable
+VPN, retain socksbridge.py -> 3proxy:1080, launch Via and navigate to an ordinary
+HTTPS URL. Confirm previously unregistered traffic establishes fallback SOCKS
+connections and the page loads/materially advances. Also check registered native
+TCP, concurrent guest DNS uniqueness/DOMAIN forwarding, native-only VPN-off
+operation, failure containment, guest close/port reuse and VPN stop/restart.
+Compilation and host tests do not establish that device result.

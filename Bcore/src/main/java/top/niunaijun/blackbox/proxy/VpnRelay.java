@@ -30,8 +30,8 @@ import static top.niunaijun.blackbox.proxy.NetworkDiagnostics.TcpDrop;
 import static top.niunaijun.blackbox.proxy.NetworkDiagnostics.FailureStage;
 
 /**
- * Relays authorized guest SOCKS transports, not arbitrary guest IP destinations.
- * NetworkHook remains the sole SOCKS5/auth/fake-IP/UDP-ASSOCIATE implementation.
+ * Descriptor registrations win; unregistered selective-TUN TCP uses SOCKS5.
+ * Native hooks retain their existing SOCKS5/auth/UDP-ASSOCIATE implementation.
  * TCP packets are redirected to a local kernel TCP listener; only its onward
  * connection is protected. Thus retransmission, windows and half-close use the
  * Android TCP stack instead of a second, incomplete userspace TCP implementation.
@@ -46,6 +46,11 @@ final class VpnRelay implements AutoCloseable {
     private final Map<VpnFlowRegistry.Key, Udp> udp = new HashMap<>();
     private final NetworkDiagnostics diagnostics;
     private VpnFlowRegistry registry;
+    private VpnMappingBroker mappingBroker;
+    private final int proxyAddress, proxyPort;
+    private final byte[] proxyUser, proxyPassword;
+    private final Map<Integer, Tcp> tcpAliases = new HashMap<>();
+    private int nextAlias = 1024; // Never recycle a kernel listener tuple within this service.
     private ServerSocket listener;
     private int listenerPort;
     private volatile boolean running = true;
@@ -81,9 +86,11 @@ final class VpnRelay implements AutoCloseable {
             Log.w("NBSVpn", "relay_failure stage=" + stage.label + " count=" + count);
     }
 
-    VpnRelay(VpnService service, ParcelFileDescriptor descriptor, File files, int proxyAddress, int proxyPort, boolean configured, NetworkDiagnostics diagnostics)
+    VpnRelay(VpnService service, ParcelFileDescriptor descriptor, File files, int proxyAddress, int proxyPort, boolean configured, byte[] proxyUser, byte[] proxyPassword, NetworkDiagnostics diagnostics)
             throws IOException {
         this.service = service;
+        this.proxyAddress = proxyAddress; this.proxyPort = proxyPort;
+        this.proxyUser = proxyUser.clone(); this.proxyPassword = proxyPassword.clone();
         this.diagnostics = diagnostics;
         tun = ParcelFileDescriptor.dup(descriptor.getFileDescriptor());
         try {
@@ -91,13 +98,14 @@ final class VpnRelay implements AutoCloseable {
             listener = new ServerSocket();
             listener.bind(new InetSocketAddress(InetAddress.getByAddress(LOCAL_BYTES), 0), 64);
             listenerPort = listener.getLocalPort();
-            registry = new VpnFlowRegistry(files, proxyAddress, proxyPort, diagnostics,
-                    new VpnTcpOwnerDiagnostics(new AndroidTcpOwnerLookup(service), android.os.Process.myUid(), diagnostics));
+            mappingBroker = new VpnMappingBroker(files, proxyAddress);
+            registry = new VpnFlowRegistry(files, proxyAddress, proxyPort, diagnostics, mappingBroker.mappings);
             new Thread(this::acceptTcp, "NBSVpnAccept").start();
         } catch (Exception failure) {
             failure(FailureStage.SETUP_DENY_ALL);
             if (registry != null) registry.close();
             registry = null;
+            if (mappingBroker != null) mappingBroker.close();
             if (listener != null) try { listener.close(); } catch (IOException ignored) { }
         }
         packetThread = new Thread(this::packets, "NBSVpnTun");
@@ -168,12 +176,13 @@ final class VpnRelay implements AutoCloseable {
         int sourcePort = u16(packet, 20), destinationPort = u16(packet, 22);
         if (source == LOCAL && destination == PEER && sourcePort == listenerPort) {
             Tcp connection;
-            synchronized (this) { connection = tcp.get(destinationPort); }
+            synchronized (this) { connection = tcpAliases.get(destinationPort); }
             if (connection == null) { diagnostics.dropTcp(TcpDrop.OTHER_POLICY); return; }
             if (!registry.live(connection.flow)) { diagnostics.dropTcp(TcpDrop.EXPIRED_REVOKED); return; }
             registry.touch(connection.flow);
             put32(packet, 12, connection.flow.key.address); put32(packet, 16, LOCAL);
             put16(packet, 20, connection.flow.key.port);
+            put16(packet, 22, connection.flow.key.sourcePort);
             rewriteChecksums(packet, count, 6);
             writeTun(packet, count); return;
         }
@@ -184,15 +193,21 @@ final class VpnRelay implements AutoCloseable {
         VpnFlowRegistry.Key key = new VpnFlowRegistry.Key(6, sourcePort, destination, destinationPort);
         VpnFlowRegistry.Flow grant = registry.authorizeTcp(key, syn, i32(packet, 24), source);
         if (grant == null) return; // Registry recorded the exact rejection.
+        Tcp connection;
         synchronized (this) {
-            Tcp connection = tcp.get(sourcePort);
+            connection = tcp.get(sourcePort);
             if (connection != null && connection.flow != grant) {
                 if (registry.live(connection.flow)) { diagnostics.dropTcp(TcpDrop.OTHER_POLICY); return; }
-                connection.close(); connection = null;
+                connection.close(); tcpAliases.remove(connection.alias); connection = null;
             }
-            if (connection == null) tcp.put(sourcePort, new Tcp(grant));
+            if (connection == null) {
+                if (nextAlias > 65535) { diagnostics.dropTcp(TcpDrop.OTHER_POLICY); return; }
+                connection = new Tcp(grant, nextAlias++);
+                tcp.put(sourcePort, connection); tcpAliases.put(connection.alias, connection);
+            }
         }
         put32(packet, 12, PEER); put32(packet, 16, LOCAL); put16(packet, 22, listenerPort);
+        put16(packet, 20, connection.alias);
         rewriteChecksums(packet, count, 6);
         if (writeTun(packet, count)) diagnostics.increment(TCP_PACKETS);
         else diagnostics.dropTcp(TcpDrop.OTHER_POLICY);
@@ -236,7 +251,7 @@ final class VpnRelay implements AutoCloseable {
             try {
                 accepted = listener.accept();
                 Tcp connection;
-                synchronized (this) { connection = tcp.get(accepted.getPort()); }
+                synchronized (this) { connection = tcpAliases.get(accepted.getPort()); }
                 if (!Arrays.equals(accepted.getInetAddress().getAddress(), bytes(PEER)) ||
                         connection == null || !registry.live(connection.flow) || !connection.attach(accepted)) {
                     accepted.close(); diagnostics.increment(TCP_LISTENER_REJECTED); continue;
@@ -252,10 +267,11 @@ final class VpnRelay implements AutoCloseable {
 
     private final class Tcp {
         final VpnFlowRegistry.Flow flow;
+        final int alias;
         private Socket local, remote;
         private boolean closed;
         private final AtomicInteger pumps = new AtomicInteger(2);
-        Tcp(VpnFlowRegistry.Flow flow) { this.flow = flow; }
+        Tcp(VpnFlowRegistry.Flow flow, int alias) { this.flow = flow; this.alias = alias; }
         synchronized boolean attach(Socket accepted) {
             if (closed || local != null) return false;
             local = accepted; return true;
@@ -270,16 +286,30 @@ final class VpnRelay implements AutoCloseable {
                 }
                 stage = FailureStage.TCP_LEASE_BEFORE_CONNECT;
                 if (!registry.live(flow)) throw new IOException("expired");
-                stage = FailureStage.TCP_PROTECT;
-                if (!service.protect(outward)) throw new IOException("protect");
-                stage = FailureStage.TCP_CONNECT;
-                outward.connect(new InetSocketAddress(InetAddress.getByAddress(bytes(flow.key.address)), flow.key.port), 10_000);
+                if (flow.owner == null) {
+                    stage = FailureStage.TCP_CONNECT;
+                    FallbackTransport.connect(outward, service::protect,
+                            new InetSocketAddress(InetAddress.getByAddress(bytes(proxyAddress)), proxyPort),
+                            negotiationTimer, proxyUser, proxyPassword, flow.key.address, flow.key.port, flow.hostname);
+                } else {
+                    stage = FailureStage.TCP_PROTECT;
+                    if (!service.protect(outward)) throw new IOException("protect");
+                    stage = FailureStage.TCP_CONNECT;
+                    outward.connect(new InetSocketAddress(InetAddress.getByAddress(bytes(flow.key.address)), flow.key.port), 10_000);
+                }
                 stage = FailureStage.TCP_LEASE_AFTER_CONNECT;
                 if (!registry.live(flow)) throw new IOException("expired");
                 diagnostics.increment(TCP_FLOWS);
+                if (flow.owner == null) {
+                    diagnostics.increment(FALLBACK_CONNECTED);
+                    diagnostics.increment(flow.hostname == null ? FALLBACK_IPV4 : FALLBACK_DOMAIN);
+                }
                 new Thread(() -> pump(local, outward), "NBSVpnTcpUp").start();
                 pump(outward, local);
-            } catch (Exception failure) { if (running) failure(stage); close(); }
+            } catch (Exception failure) {
+                if (running) { failure(stage); if (flow.owner == null) diagnostics.increment(FALLBACK_FAILED); }
+                close();
+            }
         }
         void pump(Socket from, Socket to) {
             try {
@@ -297,7 +327,7 @@ final class VpnRelay implements AutoCloseable {
         }
         synchronized void close() {
             closed = true;
-            if (registry != null) registry.remoteClosed(flow);
+            if (registry != null) { registry.remoteClosed(flow); registry.endFallback(flow); }
             if (local != null) try { local.close(); } catch (IOException ignored) { }
             if (remote != null) try { remote.close(); } catch (IOException ignored) { }
         }
@@ -347,7 +377,7 @@ final class VpnRelay implements AutoCloseable {
         synchronized (this) {
             for (Iterator<Tcp> it = tcp.values().iterator(); it.hasNext();) {
                 Tcp connection = it.next();
-                if (!registry.live(connection.flow)) { connection.close(); it.remove(); }
+                if (!registry.live(connection.flow)) { connection.close(); tcpAliases.remove(connection.alias); it.remove(); }
             }
             for (Iterator<Udp> it = udp.values().iterator(); it.hasNext();) {
                 Udp connection = it.next();
@@ -398,12 +428,17 @@ final class VpnRelay implements AutoCloseable {
         report();
     }
 
+    private final java.util.concurrent.ScheduledExecutorService negotiationTimer =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "NBSSocksDeadline"));
+
     private void disableForwarding() {
         diagnostics.relayActive(false);
         if (registry != null) registry.close();
+        if (mappingBroker != null) mappingBroker.close();
+        negotiationTimer.shutdownNow();
         if (listener != null) try { listener.close(); } catch (IOException ignored) { }
         synchronized (this) {
-            for (Tcp connection : tcp.values()) connection.close(); tcp.clear();
+            for (Tcp connection : tcp.values()) connection.close(); tcp.clear(); tcpAliases.clear();
             for (Udp connection : udp.values()) connection.socket.close(); udp.clear();
         }
     }

@@ -81,7 +81,9 @@ public class ProxyVpnService extends VpnService {
             boolean configured = settings.getBoolean("mSocksEnabled", false) && address != 0 && port > 0 && port <= 65535
                     && settings.getString("mSocksUser", "").getBytes(StandardCharsets.UTF_8).length <= 255
                     && settings.getString("mSocksPassword", "").getBytes(StandardCharsets.UTF_8).length <= 255;
-            relay = new VpnRelay(this, mVpnInterface, getFilesDir(), address, port, configured, diagnostics);
+            relay = new VpnRelay(this, mVpnInterface, getFilesDir(), address, port, configured,
+                    settings.getString("mSocksUser", "").getBytes(StandardCharsets.UTF_8),
+                    settings.getString("mSocksPassword", "").getBytes(StandardCharsets.UTF_8), diagnostics);
         } catch (Exception failure) {
             // Preserve any established interface on failure: a stopped relay is
             // deny-all containment, never a reason to restore a direct route.
