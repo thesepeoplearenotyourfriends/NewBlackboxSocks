@@ -4,272 +4,106 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
-import top.niunaijun.blackbox.utils.Slog;
-
+import java.nio.charset.StandardCharsets;
 
 public class ProxyVpnService extends VpnService {
-    private static final String TAG = "ProxyVpnService";
+    private static final String TAG = "NBSVpn";
     private static final int NOTIFICATION_ID = 1001;
     private static final String CHANNEL_ID = "BlackBoxVPN";
-    
-    private ParcelFileDescriptor mVpnInterface = null;
-    private boolean mIsEstablished = false;
-    private Thread mNetworkThread = null;
+    private ParcelFileDescriptor mVpnInterface;
+    private VpnRelay relay;
+    private boolean destroyed;
 
-    @Override
-    public void onCreate() {
+    @Override public void onCreate() {
         super.onCreate();
-        Slog.d(TAG, "ProxyVpnService created");
-        createNotificationChannel();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "BlackBox VPN Service", NotificationManager.IMPORTANCE_LOW);
+            channel.setShowBadge(false);
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) manager.createNotificationChannel(channel);
+        }
     }
 
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        Slog.d(TAG, "ProxyVpnService started");
-        
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
         try {
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                
-                startForeground(NOTIFICATION_ID, createNotification(), 
-                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-            } else {
-                startForeground(NOTIFICATION_ID, createNotification());
-            }
-            
-            Slog.d(TAG, "Foreground service started successfully");
-            
-            
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    establishVpn();
-                }
-            }, "VPNEstablishment").start();
-            
-        } catch (Exception e) {
-            Slog.e(TAG, "Critical error in onStartCommand: " + e.getMessage(), e);
-            
-            stopSelf();
+            Notification.Builder notification = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                    ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
+            Notification built = notification.setContentTitle("BlackBox VPN Active")
+                    .setContentText("Containing sandboxed network traffic")
+                    .setSmallIcon(android.R.drawable.ic_dialog_info).setOngoing(true).build();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+                startForeground(NOTIFICATION_ID, built, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            else startForeground(NOTIFICATION_ID, built);
+            establishVpn();
+        } catch (Exception failure) {
+            Log.e(TAG, "vpn_failure stage=start");
             return START_NOT_STICKY;
         }
-        
         return START_STICKY;
     }
 
-    @Override
-    public void onDestroy() {
-        super.onDestroy();
-        stopVpn();
-        Slog.d(TAG, "ProxyVpnService destroyed");
-    }
-
-    
-    private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID,
-                "BlackBox VPN Service",
-                NotificationManager.IMPORTANCE_LOW
-            );
-            channel.setDescription("VPN service for BlackBox network access");
-            channel.setShowBadge(false);
-            
-            NotificationManager notificationManager = getSystemService(NotificationManager.class);
-            if (notificationManager != null) {
-                notificationManager.createNotificationChannel(channel);
-            }
-        }
-    }
-
-    
-    private Notification createNotification() {
-        Notification.Builder builder;
-        
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            builder = new Notification.Builder(this, CHANNEL_ID);
-        } else {
-            builder = new Notification.Builder(this);
-        }
-        
-        return builder
-            .setContentTitle("BlackBox VPN Active")
-            .setContentText("Managing network access for sandboxed apps")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true)
-            .setPriority(Notification.PRIORITY_LOW)
-            .build();
-    }
-
-    
-    protected void establishVpn() {
-        
-        final long TIMEOUT_MS = 5000; 
-        final long startTime = System.currentTimeMillis();
-        
+    protected synchronized void establishVpn() {
+        if (destroyed || mVpnInterface != null) return;
         try {
-            Slog.d(TAG, "Starting VPN establishment...");
-            
-            
-            if (System.currentTimeMillis() - startTime > TIMEOUT_MS) {
-                Slog.w(TAG, "VPN establishment timeout, aborting");
-                return;
-            }
-            
-            Builder builder = new Builder();
-            
-            
-            builder.setSession("BlackBox VPN");
-            
-            
-            builder.addAddress("10.0.0.2", 32);
-            
-            
-            builder.addRoute("0.0.0.0", 0);  
-            
-            
-            builder.addDnsServer("8.8.8.8");
-            builder.addDnsServer("8.8.4.4");
-            
-            
+            Builder builder = new Builder().setSession("BlackBox authorized SOCKS networking").setMtu(1500);
+            builder.addAddress("10.0.0.2", 32).addRoute("0.0.0.0", 0);
+            // Capture unsupported IPv6 as well; it must not bypass the positive gate.
+            builder.addAddress("fd00:6e62:73::2", 128).addRoute("::", 0);
+            builder.addDnsServer("8.8.8.8").addDnsServer("8.8.4.4");
             builder.addAllowedApplication(getPackageName());
-            
-            
-            builder.setSession("BlackBox Internet Access");
-            
-            Slog.d(TAG, "VPN builder configured, establishing interface...");
-            
-            
-            if (System.currentTimeMillis() - startTime > TIMEOUT_MS) {
-                Slog.w(TAG, "VPN establishment timeout before establish(), aborting");
-                return;
-            }
-            
-            
+            builder.setBlocking(false);
             mVpnInterface = builder.establish();
-            if (mVpnInterface != null) {
-                mIsEstablished = true;
-                Slog.d(TAG, "VPN interface established successfully");
-                
-                
-                startNetworkHandling();
-            } else {
-                Slog.e(TAG, "Failed to establish VPN interface - builder.establish() returned null");
+            if (mVpnInterface == null) { Log.e(TAG, "vpn_failure stage=establish"); return; }
+            SharedPreferences settings = getSharedPreferences("AppSharedPreferenceDelegate", MODE_PRIVATE);
+            int address = numericAddress(settings.getString("mSocksHost", "127.0.0.1"));
+            int port;
+            try { port = Integer.parseInt(settings.getString("mSocksPort", "1080")); }
+            catch (NumberFormatException invalid) { port = 0; }
+            boolean configured = settings.getBoolean("mSocksEnabled", false) && address != 0 && port > 0 && port <= 65535
+                    && settings.getString("mSocksUser", "").getBytes(StandardCharsets.UTF_8).length <= 255
+                    && settings.getString("mSocksPassword", "").getBytes(StandardCharsets.UTF_8).length <= 255;
+            relay = new VpnRelay(this, mVpnInterface, getFilesDir(), address, port, configured);
+        } catch (Exception failure) {
+            // Preserve any established interface on failure: a stopped relay is
+            // deny-all containment, never a reason to restore a direct route.
+            Log.e(TAG, "vpn_failure stage=setup-deny-all");
+        }
+    }
+
+    private static int numericAddress(String host) {
+        if (host == null) return 0;
+        String[] parts = host.split("\\.", -1);
+        if (parts.length != 4) return 0;
+        int address = 0;
+        for (String part : parts) {
+            if (part.isEmpty() || part.length() > 3 || (part.length() > 1 && part.charAt(0) == '0')) return 0;
+            int value = 0;
+            for (int i = 0; i < part.length(); i++) {
+                char digit = part.charAt(i);
+                if (digit < '0' || digit > '9') return 0;
+                value = value * 10 + digit - '0';
             }
-            
-        } catch (Exception e) {
-            Slog.e(TAG, "Error establishing VPN: " + e.getMessage());
-            e.printStackTrace();
-            
-            mIsEstablished = false;
+            if (value > 255) return 0;
+            address = (address << 8) | value;
         }
-        
-        
-        if (System.currentTimeMillis() - startTime > TIMEOUT_MS) {
-            Slog.w(TAG, "VPN establishment took too long: " + (System.currentTimeMillis() - startTime) + "ms");
-        }
+        return address;
     }
 
-    
-    private void startNetworkHandling() {
-        if (mNetworkThread != null && mNetworkThread.isAlive()) {
-            mNetworkThread.interrupt();
-        }
-        
-        mNetworkThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    while (mIsEstablished && mVpnInterface != null && !Thread.interrupted()) {
-                        
-                        Thread.sleep(10000); 
-                        
-                        
-                        Slog.d(TAG, "VPN interface active, monitoring network...");
-                        
-                        
-                        if (mVpnInterface != null) {
-                            try {
-                                
-                                mVpnInterface.getFd();
-                            } catch (Exception e) {
-                                Slog.w(TAG, "VPN interface appears to be closed, re-establishing...");
-                                reestablishVpn();
-                                break;
-                            }
-                        }
-                    }
-                } catch (InterruptedException e) {
-                    Slog.w(TAG, "Network monitoring interrupted: " + e.getMessage());
-                } catch (Exception e) {
-                    Slog.e(TAG, "Error in network monitoring: " + e.getMessage());
-                }
-            }
-        }, "BlackBoxNetworkHandler");
-        
-        mNetworkThread.start();
-        Slog.d(TAG, "Network handling thread started");
-    }
-
-    
-    private void reestablishVpn() {
-        try {
-            Slog.d(TAG, "Attempting to re-establish VPN connection");
-            stopVpn();
-            Thread.sleep(1000); 
-            establishVpn();
-        } catch (Exception e) {
-            Slog.e(TAG, "Failed to re-establish VPN: " + e.getMessage());
-        }
-    }
-
-    
-    private void stopVpn() {
-        mIsEstablished = false;
-        
-        if (mNetworkThread != null) {
-            mNetworkThread.interrupt();
-            mNetworkThread = null;
-        }
-        
+    private synchronized void stopVpn() {
+        if (relay != null) { relay.close(); relay = null; }
         if (mVpnInterface != null) {
-            try {
-                mVpnInterface.close();
-                mVpnInterface = null;
-                Slog.d(TAG, "VPN interface closed");
-            } catch (Exception e) {
-                Slog.w(TAG, "Error closing VPN interface: " + e.getMessage());
-            }
+            try { mVpnInterface.close(); } catch (Exception ignored) { }
+            mVpnInterface = null;
         }
     }
-
-    
-    public boolean isEstablished() {
-        return mIsEstablished && mVpnInterface != null;
-    }
-
-    
-    public ParcelFileDescriptor getVpnInterface() {
-        return mVpnInterface;
-    }
-
-    @Override
-    public void onRevoke() {
-        super.onRevoke();
-        Slog.w(TAG, "VPN service revoked by user");
-        stopVpn();
-    }
-
-    @Override
-    public void onTrimMemory(int level) {
-        super.onTrimMemory(level);
-        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_MODERATE) {
-            Slog.d(TAG, "Memory trim requested, optimizing VPN service");
-        }
-    }
+    public synchronized boolean isEstablished() { return mVpnInterface != null; }
+    public synchronized ParcelFileDescriptor getVpnInterface() { return mVpnInterface; }
+    @Override public synchronized void onDestroy() { destroyed = true; stopVpn(); super.onDestroy(); }
+    @Override public void onRevoke() { stopVpn(); super.onRevoke(); }
 }

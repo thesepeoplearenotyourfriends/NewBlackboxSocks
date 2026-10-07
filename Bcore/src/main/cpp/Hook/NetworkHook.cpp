@@ -21,6 +21,8 @@
 #include <string>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/un.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unordered_map>
 #include <vector>
@@ -86,6 +88,129 @@ uint32_t nextFakeOffset;
 std::atomic<bool> proxyProbeAttempted{false};
 std::atomic<bool> loggedUnix{false};
 
+// Per-socket capability channels live only as long as the intercepted socket (and
+// its dup aliases). Closing the last channel revokes every tuple registered on it.
+// Raw syscalls here avoid re-entering guest send/close hooks for private AF_UNIX IPC.
+std::string flowSocketPath;
+struct FlowLease {
+    int channel = -1;
+    std::mutex mutex;
+    ~FlowLease() { if (channel >= 0) syscall(SYS_close, channel); }
+};
+std::mutex flowLeasesMutex;
+std::unordered_map<int, std::shared_ptr<FlowLease>> flowLeases;
+void releaseFlow(int fd) {
+    std::lock_guard<std::mutex> lock(flowLeasesMutex);
+    flowLeases.erase(fd);
+}
+
+bool authorizeTransportImpl(int fd, const sockaddr *peer, socklen_t length,
+                            const uint8_t *udpHeader, size_t headerSize, int controlFd) {
+    if (flowSocketPath.empty()) return true; // Existing non-VPN SOCKS mode.
+    sockaddr_in destination{};
+    if (peer && peer->sa_family == AF_INET && length >= sizeof(sockaddr_in)) {
+        destination = *reinterpret_cast<const sockaddr_in *>(peer);
+    } else if (peer && peer->sa_family == AF_INET6 && length >= sizeof(sockaddr_in6) &&
+               IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<const sockaddr_in6 *>(peer)->sin6_addr)) {
+        const auto *v6 = reinterpret_cast<const sockaddr_in6 *>(peer);
+        destination.sin_family = AF_INET;
+        destination.sin_port = v6->sin6_port;
+        memcpy(&destination.sin_addr, &v6->sin6_addr.s6_addr[12], 4);
+    } else { errno = EAFNOSUPPORT; return false; }
+    std::shared_ptr<FlowLease> lease;
+    {
+        std::lock_guard<std::mutex> lock(flowLeasesMutex);
+        if (!flowLeases.count(fd) && flowLeases.size() >= 256) { errno = ENOBUFS; return false; }
+        auto &entry = flowLeases[fd];
+        if (!entry) entry = std::make_shared<FlowLease>();
+        lease = entry;
+    }
+    std::lock_guard<std::mutex> lock(lease->mutex);
+    bool first = lease->channel < 0;
+    if (first) {
+        sockaddr_storage local{}; socklen_t localSize = sizeof(local);
+        if (getsockname(fd, reinterpret_cast<sockaddr *>(&local), &localSize) != 0) return false;
+        uint16_t port = local.ss_family == AF_INET ? reinterpret_cast<sockaddr_in *>(&local)->sin_port
+                         : reinterpret_cast<sockaddr_in6 *>(&local)->sin6_port;
+        if (port == 0) {
+            // Bind before registration/connect: the VPN must see the exact source
+            // port, including the very first SYN/datagram. Never register a wildcard.
+            if (local.ss_family == AF_INET) {
+                auto *v4 = reinterpret_cast<sockaddr_in *>(&local);
+                inet_pton(AF_INET, "10.0.0.2", &v4->sin_addr);
+            } else if (local.ss_family == AF_INET6) {
+                auto *v6 = reinterpret_cast<sockaddr_in6 *>(&local);
+                memset(&v6->sin6_addr, 0, sizeof(v6->sin6_addr));
+                v6->sin6_addr.s6_addr[10] = v6->sin6_addr.s6_addr[11] = 0xff;
+                inet_pton(AF_INET, "10.0.0.2", &v6->sin6_addr.s6_addr[12]);
+            } else { errno = EAFNOSUPPORT; return false; }
+            if (syscall(SYS_bind, fd, &local, localSize) != 0) return false;
+        }
+        if (flowSocketPath.size() >= sizeof(sockaddr_un::sun_path)) { errno = ENAMETOOLONG; return false; }
+        int channel = static_cast<int>(syscall(SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        if (channel < 0) return false;
+        sockaddr_un address{}; address.sun_family = AF_UNIX;
+        memcpy(address.sun_path, flowSocketPath.c_str(), flowSocketPath.size() + 1);
+        timeval timeout{2, 0};
+        setsockopt(channel, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(channel, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        if (syscall(SYS_connect, channel, &address, sizeof(address)) != 0) {
+            int error = errno; syscall(SYS_close, channel); errno = error; return false;
+        }
+        ucred peerCredentials{}; socklen_t credentialSize = sizeof(peerCredentials);
+        if (getsockopt(channel, SOL_SOCKET, SO_PEERCRED, &peerCredentials, &credentialSize) != 0 ||
+            peerCredentials.uid != geteuid()) {
+            syscall(SYS_close, channel); errno = EACCES; return false;
+        }
+        lease->channel = channel;
+    }
+    // Version, protocol, outer destination, then exact SOCKS UDP destination header.
+    // Credentials, hostnames and payloads are never sent to diagnostics.
+    uint8_t request[11] = {'N', 'B', 'S', 1, static_cast<uint8_t>(udpHeader ? 17 : 6)};
+    memcpy(request + 5, &destination.sin_addr, 4);
+    memcpy(request + 9, &destination.sin_port, 2);
+    if (headerSize > 262) { errno = EMSGSIZE; return false; }
+    std::vector<uint8_t> message(request, request + 11);
+    message.push_back(static_cast<uint8_t>(headerSize >> 8));
+    message.push_back(static_cast<uint8_t>(headerSize));
+    if (headerSize) message.insert(message.end(), udpHeader, udpHeader + headerSize);
+    iovec data{message.data(), message.size()};
+    char ancillary[CMSG_SPACE(2 * sizeof(int))]{};
+    msghdr msg{}; msg.msg_iov = &data; msg.msg_iovlen = 1;
+    if (first) {
+        const int descriptors[2] = {fd, controlFd};
+        const size_t descriptorSize = udpHeader ? sizeof(descriptors) : sizeof(int);
+        if (udpHeader && controlFd < 0) { errno = EACCES; return false; }
+        msg.msg_control = ancillary; msg.msg_controllen = CMSG_SPACE(descriptorSize);
+        cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET; cmsg->cmsg_type = SCM_RIGHTS; cmsg->cmsg_len = CMSG_LEN(descriptorSize);
+        memcpy(CMSG_DATA(cmsg), descriptors, descriptorSize);
+    }
+    ssize_t sent = syscall(SYS_sendmsg, lease->channel, &msg, MSG_NOSIGNAL);
+    uint8_t accepted = 0;
+    bool ok = sent == static_cast<ssize_t>(message.size()) &&
+              syscall(SYS_recvfrom, lease->channel, &accepted, 1, 0, nullptr, nullptr) == 1 && accepted == 1;
+    if (!ok) {
+        syscall(SYS_close, lease->channel); lease->channel = -1;
+        errno = EACCES;
+    }
+    return ok;
+}
+
+bool authorizeTransport(int fd, const sockaddr *peer, socklen_t length,
+                        const uint8_t *udpHeader = nullptr, size_t headerSize = 0, int controlFd = -1) {
+    if (authorizeTransportImpl(fd, peer, length, udpHeader, headerSize, controlFd)) return true;
+    int error = errno;
+    static std::atomic<unsigned> failures{0};
+    unsigned count = ++failures;
+    if (count <= 4 || (count & (count - 1)) == 0)
+        ALOGE("NetworkPolicy: flow registration failed protocol=%s errno=%d count=%u", udpHeader ? "UDP" : "TCP", error, count);
+    errno = error;
+    return false;
+}
+
+void closeTransport(int fd) { releaseFlow(fd); originalClose(fd); }
+
 struct UdpState {
     std::mutex mutex;
     int control = -1;
@@ -94,7 +219,7 @@ struct UdpState {
     sockaddr_storage peer{};
     socklen_t peerLength = 0;
     bool associated = false;
-    ~UdpState() { if (control >= 0 && originalClose) originalClose(control); }
+    ~UdpState() { if (control >= 0 && originalClose) closeTransport(control); }
 };
 std::mutex udpStatesMutex;
 std::unordered_map<int, std::shared_ptr<UdpState>> udpStates;
@@ -168,14 +293,24 @@ int replyErrno(uint8_t reply) {
 
 bool socksFailure(const char *stage, int error) {
     errno = error;
-    ALOGE("NetworkHook: SOCKS failure stage=%s errno=%d", stage, error);
+    // Stages are fixed internal literals, so this table remains bounded and each
+    // failure stage is visible even if another stage has already been noisy.
+    static std::mutex mutex;
+    static std::unordered_map<std::string, unsigned> failures;
+    unsigned count;
+    { std::lock_guard<std::mutex> lock(mutex); count = ++failures[stage]; }
+    if (count <= 8 || (count & (count - 1)) == 0)
+        ALOGE("NetworkHook: SOCKS failure stage=%s errno=%d count=%u", stage, error, count);
     errno = error;
     return false;
 }
 
 bool socksReplyFailure(uint8_t reply, int error) {
     errno = error;
-    ALOGE("NetworkHook: SOCKS failure stage=connect-reply reply=%u errno=%d", reply, error);
+    static std::atomic<unsigned> failures{0};
+    unsigned count = ++failures;
+    if (count <= 8 || (count & (count - 1)) == 0)
+        ALOGE("NetworkHook: SOCKS failure stage=connect-reply reply=%u errno=%d count=%u", reply, error, count);
     errno = error;
     return false;
 }
@@ -255,6 +390,7 @@ bool waitForProxyConnect(int fd, int64_t deadline) {
 }
 
 bool connectWithDeadline(int fd, const sockaddr *address, socklen_t length, int64_t deadline) {
+    if (!authorizeTransport(fd, address, length)) return false;
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) return false;
     int result = originalConnect(fd, address, length);
@@ -273,6 +409,7 @@ bool connectWithDeadline(int fd, const sockaddr *address, socklen_t length, int6
 }
 
 void probeProxyOnce(int originalError) {
+    if (!flowSocketPath.empty()) return; // No unregistered diagnostic network traffic.
     if (originalError != EINVAL && originalError != EAFNOSUPPORT) return;
     bool expected = false;
     if (!proxyProbeAttempted.compare_exchange_strong(expected, true)) return;
@@ -442,36 +579,36 @@ bool socksAuthenticate(int fd, int64_t deadline) {
 
 bool ensureUdpAssociation(const std::shared_ptr<UdpState> &state) {
     if (state->associated) return true;
-    if (!config.valid) { errno = EINVAL; return false; }
+    if (!config.valid) return socksFailure("udp-configuration", EINVAL);
     const int64_t deadline = nowMs() + kTimeoutMs;
     int control = originalSocket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (control < 0) return false;
+    if (control < 0) return socksFailure("udp-control-socket", errno);
     if (!connectWithDeadline(control, reinterpret_cast<const sockaddr *>(&config.proxy), sizeof(config.proxy), deadline) ||
         !socksAuthenticate(control, deadline)) {
-        int error = errno; originalClose(control); errno = error; return false;
+        int error = errno; closeTransport(control); return socksFailure("udp-connect-or-auth", error);
     }
     // RFC 1928: 0.0.0.0:0 asks the server to choose the relay and source binding.
     uint8_t request[10] = {5, 3, 0, 1, 0, 0, 0, 0, 0, 0};
     if (!writeAll(control, request, sizeof(request), deadline)) {
-        int error = errno; originalClose(control); errno = error; return false;
+        int error = errno; closeTransport(control); return socksFailure("udp-associate-write", error);
     }
     uint8_t header[4];
     if (!readAll(control, header, 4, deadline)) {
-        int error = errno; originalClose(control); errno = error; return false;
+        int error = errno; closeTransport(control); return socksFailure("udp-associate-header", error);
     }
     if (header[0] != 5 || header[2] != 0) {
-        originalClose(control); errno = EPROTO; return false;
+        closeTransport(control); return socksFailure("udp-associate-header", EPROTO);
     }
     if (header[1] != 0) {
-        int error = replyErrno(header[1]); originalClose(control);
-        ALOGE("NetworkPolicy: UDP ASSOCIATE refused reply=%u", header[1]); errno = error; return false;
+        int error = replyErrno(header[1]); closeTransport(control);
+        return socksFailure("udp-associate-reply", error);
     }
     sockaddr_storage relay{};
     if (header[3] == 1) {
         auto *v4 = reinterpret_cast<sockaddr_in *>(&relay); v4->sin_family = AF_INET;
         if (!readAll(control, reinterpret_cast<uint8_t *>(&v4->sin_addr), 4, deadline) ||
             !readAll(control, reinterpret_cast<uint8_t *>(&v4->sin_port), 2, deadline)) {
-            int error = errno; originalClose(control); errno = error; return false;
+            int error = errno; closeTransport(control); return socksFailure("udp-associate-tail", error);
         }
         // Servers commonly return INADDR_ANY to mean the TCP peer address.
         if (v4->sin_addr.s_addr == INADDR_ANY) v4->sin_addr = config.proxy.sin_addr;
@@ -480,18 +617,18 @@ bool ensureUdpAssociation(const std::shared_ptr<UdpState> &state) {
         auto *v6 = reinterpret_cast<sockaddr_in6 *>(&relay); v6->sin6_family = AF_INET6;
         if (!readAll(control, reinterpret_cast<uint8_t *>(&v6->sin6_addr), 16, deadline) ||
             !readAll(control, reinterpret_cast<uint8_t *>(&v6->sin6_port), 2, deadline)) {
-            int error = errno; originalClose(control); errno = error; return false;
+            int error = errno; closeTransport(control); return socksFailure("udp-associate-tail", error);
         }
         state->relayLength = sizeof(sockaddr_in6);
     } else if (header[3] == 3) {
         uint8_t nameLength = 0;
         if (!readAll(control, &nameLength, 1, deadline) || nameLength == 0) {
-            int error = errno ? errno : EPROTO; originalClose(control); errno = error; return false;
+            int error = errno ? errno : EPROTO; closeTransport(control); return socksFailure("udp-associate-tail", error);
         }
         std::string relayName(nameLength, '\0'); uint16_t relayPort;
         if (!readAll(control, reinterpret_cast<uint8_t *>(&relayName[0]), nameLength, deadline) ||
             !readAll(control, reinterpret_cast<uint8_t *>(&relayPort), 2, deadline)) {
-            int error = errno; originalClose(control); errno = error; return false;
+            int error = errno; closeTransport(control); return socksFailure("udp-associate-tail", error);
         }
         // A DOMAIN relay is valid RFC1928. Resolve only this proxy-supplied control
         // endpoint; guest hostnames never enter this path and remain SOCKS DOMAIN.
@@ -499,15 +636,15 @@ bool ensureUdpAssociation(const std::shared_ptr<UdpState> &state) {
         addrinfo *answers = nullptr;
         int resolveError = originalGetAddrInfo(relayName.c_str(), nullptr, &hints, &answers);
         if (resolveError != 0 || !answers || answers->ai_addrlen > sizeof(relay)) {
-            if (answers) freeaddrinfo(answers); originalClose(control); errno = EHOSTUNREACH; return false;
+            if (answers) freeaddrinfo(answers); closeTransport(control); return socksFailure("udp-relay-resolution", EHOSTUNREACH);
         }
         memcpy(&relay, answers->ai_addr, answers->ai_addrlen); state->relayLength = answers->ai_addrlen;
         if (relay.ss_family == AF_INET) reinterpret_cast<sockaddr_in *>(&relay)->sin_port = relayPort;
         else if (relay.ss_family == AF_INET6) reinterpret_cast<sockaddr_in6 *>(&relay)->sin6_port = relayPort;
-        else { freeaddrinfo(answers); originalClose(control); errno = EAFNOSUPPORT; return false; }
+        else { freeaddrinfo(answers); closeTransport(control); return socksFailure("udp-relay-family", EAFNOSUPPORT); }
         freeaddrinfo(answers);
     } else {
-        originalClose(control); errno = EAFNOSUPPORT; return false;
+        closeTransport(control); return socksFailure("udp-associate-type", EAFNOSUPPORT);
     }
     state->control = control; state->relay = relay; state->associated = true;
     return true;
@@ -554,6 +691,7 @@ ssize_t udpSend(int fd, const void *buffer, size_t size, int flags,
     if (synthetic) { packet.push_back(static_cast<uint8_t>(hostname.size())); packet.insert(packet.end(), hostname.begin(), hostname.end()); }
     else { const uint8_t *ip = reinterpret_cast<const uint8_t *>(&destination.sin_addr); packet.insert(packet.end(), ip, ip + 4); }
     const uint8_t *port = reinterpret_cast<const uint8_t *>(&destination.sin_port); packet.insert(packet.end(), port, port + 2);
+    const size_t headerSize = packet.size();
     const uint8_t *data = reinterpret_cast<const uint8_t *>(buffer); packet.insert(packet.end(), data, data + size);
     sockaddr_storage relay = state->relay; socklen_t relayLength = state->relayLength;
     int domain = AF_INET; socklen_t dl = sizeof(domain); getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &dl);
@@ -563,9 +701,16 @@ ssize_t udpSend(int fd, const void *buffer, size_t size, int flags,
         mapped->sin6_addr.s6_addr[10] = mapped->sin6_addr.s6_addr[11] = 0xff;
         memcpy(&mapped->sin6_addr.s6_addr[12], &v4.sin_addr, 4); relayLength = sizeof(*mapped);
     }
+    if (!authorizeTransport(fd, reinterpret_cast<sockaddr *>(&relay), relayLength, packet.data(), headerSize, state->control)) return -1;
     ssize_t result = originalSendTo(fd, packet.data(), packet.size(), flags,
                                     reinterpret_cast<sockaddr *>(&relay), relayLength);
-    if (result >= 0) { ALOGD("NetworkPolicy: UDP SOCKS %s", synthetic ? "DOMAIN" : "IPv4"); return static_cast<ssize_t>(size); }
+    if (result >= 0) {
+        static std::atomic<unsigned> forwarded{0};
+        unsigned count = ++forwarded;
+        if (count <= 4 || (count & (count - 1)) == 0)
+            ALOGD("NetworkPolicy: UDP SOCKS forwarded count=%u", count);
+        return static_cast<ssize_t>(size);
+    }
     return -1;
 }
 
@@ -665,6 +810,7 @@ int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
         return -1;
     }
 
+    if (!authorizeTransport(fd, proxyAddress, proxyLength)) return -1;
     if (!(flags & O_NONBLOCK) && fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) return -1;
     const int64_t deadline = nowMs() + kTimeoutMs;
     ALOGD("NetworkHook: proxy TCP connect start fd=%d socket_domain=%d proxy_family=%d",
@@ -717,6 +863,7 @@ int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
     bool reportInProgress = result == 0 && (flags & O_NONBLOCK);
     int savedErrno = reportInProgress ? EINPROGRESS : errno;
     if (!(flags & O_NONBLOCK) && fcntl(fd, F_SETFL, flags) != 0 && result == 0) { savedErrno = errno; result = -1; }
+    if (result != 0) releaseFlow(fd);
     errno = savedErrno;
     return reportInProgress ? -1 : result;
 }
@@ -885,8 +1032,11 @@ int hookedSocket(int domain, int type, int protocol) {
         ALOGE("NetworkPolicy: unhandled Internet path=socket type=%d protocol=%d", type & 0xf, protocol);
     return fd;
 }
-int hookedClose(int fd) { { std::lock_guard<std::mutex> lock(udpStatesMutex); udpStates.erase(fd); } return originalClose(fd); }
-void duplicateState(int from, int to) { std::lock_guard<std::mutex> lock(udpStatesMutex); auto it = udpStates.find(from); if (it != udpStates.end()) udpStates[to] = it->second; else udpStates.erase(to); }
+int hookedClose(int fd) { releaseFlow(fd); { std::lock_guard<std::mutex> lock(udpStatesMutex); udpStates.erase(fd); } return originalClose(fd); }
+void duplicateState(int from, int to) {
+    { std::lock_guard<std::mutex> lock(flowLeasesMutex); auto it = flowLeases.find(from); if (it != flowLeases.end()) flowLeases[to] = it->second; else flowLeases.erase(to); }
+    { std::lock_guard<std::mutex> lock(udpStatesMutex); auto it = udpStates.find(from); if (it != udpStates.end()) udpStates[to] = it->second; else udpStates.erase(to); }
+}
 int hookedDup(int fd) { int result = originalDup(fd); if (result >= 0) duplicateState(fd, result); return result; }
 int hookedDup2(int fd, int target) { int result = originalDup2(fd, target); if (result >= 0) duplicateState(fd, result); return result; }
 int hookedDup3(int fd, int target, int flags) { int result = originalDup3(fd, target, flags); if (result >= 0) duplicateState(fd, result); return result; }
@@ -951,7 +1101,7 @@ void runSelfTestIfRequested(bool networkBinding, bool mmsg) {
 } // namespace
 
 void NetworkHook::configure(JNIEnv *env, bool enabled, jstring host, int port,
-                            jstring user, jstring password) {
+                            jstring user, jstring password, jstring socketPath) {
     config = Config{};
     config.requested = enabled;
     if (!enabled) return;
@@ -968,6 +1118,7 @@ void NetworkHook::configure(JNIEnv *env, bool enabled, jstring host, int port,
         return result;
     };
     config.user = copy(user); config.password = copy(password);
+    flowSocketPath = copy(socketPath);
     config.valid = valid && port >= 1 && port <= 65535 &&
                    config.user.size() <= 255 && config.password.size() <= 255;
     if (!config.valid) ALOGE("NetworkHook: invalid configuration; guest networking will fail closed");

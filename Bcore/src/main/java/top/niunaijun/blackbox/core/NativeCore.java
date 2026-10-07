@@ -29,7 +29,8 @@ public class NativeCore {
     }
 
     private static native void initNative(int apiLevel, boolean guest, boolean enabled,
-                                          String host, int port, String user, String password);
+                                          String host, int port, String user, String password,
+                                          String flowSocketPath);
 
     /** Snapshot host settings once. Native connect interception performs no JNI or preference I/O. */
     public static void init(int apiLevel) {
@@ -40,7 +41,10 @@ public class NativeCore {
                 preferences.getString("mSocksHost", "127.0.0.1"),
                 parsePort(preferences.getString("mSocksPort", "1080")),
                 preferences.getString("mSocksUser", ""),
-                preferences.getString("mSocksPassword", ""));
+                preferences.getString("mSocksPassword", ""),
+                guest && BlackBoxCore.get().isUseVpnNetwork()
+                        ? new File(BlackBoxCore.getContext().getFilesDir(), "nbs-flow.sock").getAbsolutePath()
+                        : "");
     }
 
     private static int parsePort(String value) {
@@ -52,6 +56,9 @@ public class NativeCore {
     }
 
     public static native void enableIO();
+
+    /** Socket type, or -1 on inspection failure/unsupported type/reusable UDP port. */
+    public static native int getExclusiveSocketType(int fd);
 
     public static native void addIORule(String targetPath, String relocatePath);
 
