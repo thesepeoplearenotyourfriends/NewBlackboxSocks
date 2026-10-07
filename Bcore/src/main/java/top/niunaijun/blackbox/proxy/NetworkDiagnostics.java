@@ -10,8 +10,8 @@ public final class NetworkDiagnostics {
         TCP_NO_REGISTRATION, TCP_TUPLE_MISMATCH, TCP_EXPIRED_REVOKED,
         TCP_SYN_GENERATION, TCP_MALFORMED, TCP_SOURCE_ADDRESS, TCP_OTHER_POLICY,
         TCP_LISTENER_REJECTED,
-        TCP_OWNER_NBS, TCP_OWNER_OTHER, TCP_OWNER_INVALID, TCP_OWNER_UNAVAILABLE,
-        TCP_OWNER_NBS_SYNTHETIC, TCP_OWNER_NBS_ORDINARY,
+        FALLBACK_ACCEPTED, FALLBACK_CONNECTED, FALLBACK_IPV4, FALLBACK_DOMAIN,
+        SYNTHETIC_MISS, FALLBACK_FAILED,
         UDP_FLOWS, UDP_PACKETS, UDP_DROPPED, UDP_TICKET_EXPIRED,
         OTHER_DROPPED, RELAY_FAILED
     }
@@ -52,15 +52,6 @@ public final class NetworkDiagnostics {
     }
 
     synchronized void increment(Counter counter) { add(counter); }
-    synchronized void recordTcpOwner(int owner, int processUid, boolean synthetic) {
-        // Android Process.INVALID_UID is -1. Any negative/no-owner result is unknown.
-        if (owner < 0) add(Counter.TCP_OWNER_INVALID);
-        else if (owner != processUid) add(Counter.TCP_OWNER_OTHER);
-        else {
-            add(Counter.TCP_OWNER_NBS);
-            add(synthetic ? Counter.TCP_OWNER_NBS_SYNTHETIC : Counter.TCP_OWNER_NBS_ORDINARY);
-        }
-    }
     synchronized void dropTcp(TcpDrop reason) { add(Counter.TCP_DROPPED); add(reason.counter); }
     synchronized long failure(FailureStage stage) {
         add(Counter.RELAY_FAILED);
@@ -116,14 +107,13 @@ public final class NetworkDiagnostics {
             line(out, "dropped — source/address policy", Counter.TCP_SOURCE_ADDRESS);
             line(out, "dropped — other policy (including relay unavailable)", Counter.TCP_OTHER_POLICY);
             line(out, "rejected local listener connections", Counter.TCP_LISTENER_REJECTED);
-            out.append("\nUnregistered initial SYN owner evidence (diagnostic only; still dropped)\n");
-            line(out, "NBS/current process UID", Counter.TCP_OWNER_NBS);
-            line(out, "another UID", Counter.TCP_OWNER_OTHER);
-            line(out, "INVALID_UID / no owner found", Counter.TCP_OWNER_INVALID);
-            line(out, "lookup unavailable / failed", Counter.TCP_OWNER_UNAVAILABLE);
-            line(out, "NBS owner — synthetic fake-DNS IPv4", Counter.TCP_OWNER_NBS_SYNTHETIC);
-            line(out, "NBS owner — ordinary IPv4", Counter.TCP_OWNER_NBS_ORDINARY);
-            out.append("  Counts SYN observations, including retransmissions; ownership races can yield no owner.\n");
+            out.append("\nSelective VPN TCP fallback\n");
+            line(out, "accepted flows", Counter.FALLBACK_ACCEPTED);
+            line(out, "SOCKS connections established", Counter.FALLBACK_CONNECTED);
+            line(out, "IPv4 CONNECTs established", Counter.FALLBACK_IPV4);
+            line(out, "DOMAIN CONNECTs established", Counter.FALLBACK_DOMAIN);
+            line(out, "synthetic mapping misses", Counter.SYNTHETIC_MISS);
+            line(out, "SOCKS transport/negotiation failures", Counter.FALLBACK_FAILED);
             out.append("\nUDP\n");
             line(out, "authorized flows (first datagram sent)", Counter.UDP_FLOWS);
             line(out, "forwarded packets (guest to relay)", Counter.UDP_PACKETS);

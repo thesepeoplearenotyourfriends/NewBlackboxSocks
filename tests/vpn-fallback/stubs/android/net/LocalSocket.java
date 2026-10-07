@@ -1,0 +1,3 @@
+package android.net;
+// Host-only Android boundary stub; no Android IPC behavior is asserted.
+public class LocalSocket  { public void bind(LocalSocketAddress a) {} public void close() throws java.io.IOException {} public java.io.FileDescriptor getFileDescriptor() { return new java.io.FileDescriptor(); } public Credentials getPeerCredentials() { return new Credentials(); } public void setSoTimeout(int timeout) {} public java.io.InputStream getInputStream() { return new java.io.ByteArrayInputStream(new byte[0]); } public java.io.OutputStream getOutputStream() { return new java.io.ByteArrayOutputStream(); } public java.io.FileDescriptor[] getAncillaryFileDescriptors() throws java.io.IOException { return null; } }

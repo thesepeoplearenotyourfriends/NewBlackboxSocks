@@ -13,52 +13,10 @@ import static top.niunaijun.blackbox.proxy.NetworkDiagnostics.FailureStage;
 public final class NetworkDiagnosticsTest {
     public static void main(String[] args) throws Exception {
         classifications();
-        ownerEvidence();
         resetAndSnapshots();
         concurrentAccounting();
         saturation();
         System.out.println("Network diagnostics host checks passed (classification, reset, snapshots, concurrency, saturation).");
-    }
-
-    private static void ownerEvidence() {
-        NetworkDiagnostics d = new NetworkDiagnostics();
-        int[] calls = {0};
-        int[] uid = {12345};
-        VpnTcpOwnerDiagnostics observer = new VpnTcpOwnerDiagnostics((source, sp, destination, dp) -> {
-            calls[0]++;
-            equal(0x0a000002, source); equal(43210, sp);
-            equal(0xc6120000, destination); equal(443, dp);
-            if (uid[0] == -2) throw new SecurityException();
-            return uid[0];
-        }, 12345, d);
-        for (TcpDrop reason : TcpDrop.values()) {
-            if (reason != TcpDrop.NO_REGISTRATION)
-                observer.observe(reason, true, 0, 0, 0, 0);
-        }
-        observer.observe(TcpDrop.NO_REGISTRATION, false, 0, 0, 0, 0);
-        equal(0, calls[0]); // registered/mismatched/established paths do not query
-        for (int result : new int[]{12345, 99999, -1, -2}) {
-            uid[0] = result;
-            observer.observe(TcpDrop.NO_REGISTRATION, true, 0x0a000002, 43210, 0xc6120000, 443);
-        }
-        new VpnTcpOwnerDiagnostics(null, 12345, d)
-                .observe(TcpDrop.NO_REGISTRATION, true, 0, 0, 0, 0);
-        new VpnTcpOwnerDiagnostics((a,b,c,e) -> 12345, 12345, d)
-                .observe(TcpDrop.NO_REGISTRATION, true, 0, 0, 0x08080808, 443);
-        NetworkDiagnostics.Snapshot snap = d.snapshot();
-        equal(2L, snap.count(TCP_OWNER_NBS)); equal(1L, snap.count(TCP_OWNER_OTHER));
-        equal(1L, snap.count(TCP_OWNER_INVALID)); equal(2L, snap.count(TCP_OWNER_UNAVAILABLE));
-        equal(1L, snap.count(TCP_OWNER_NBS_SYNTHETIC)); equal(1L, snap.count(TCP_OWNER_NBS_ORDINARY));
-        equal(0L, snap.count(TCP_FIRST_SYN)); equal(0L, snap.count(TCP_FLOWS));
-        equal(0L, snap.count(TCP_PACKETS)); // evidence cannot affect authorization/forwarding
-        check(!VpnTcpOwnerDiagnostics.synthetic(0xc611ffff));
-        check(VpnTcpOwnerDiagnostics.synthetic(0xc6120000));
-        check(VpnTcpOwnerDiagnostics.synthetic(0xc613ffff));
-        check(!VpnTcpOwnerDiagnostics.synthetic(0xc6140000));
-        check(!VpnTcpOwnerDiagnostics.synthetic(0x08080808));
-        check(snap.toPlainText(true).contains("diagnostic only; still dropped"));
-        d.reset();
-        for (NetworkDiagnostics.Counter counter : NetworkDiagnostics.Counter.values()) equal(0L, d.snapshot().count(counter));
     }
 
     private static void classifications() {

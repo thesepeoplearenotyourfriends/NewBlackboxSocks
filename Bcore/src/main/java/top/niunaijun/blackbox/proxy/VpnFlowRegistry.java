@@ -47,7 +47,9 @@ final class VpnFlowRegistry implements AutoCloseable {
     private final File path;
     private final int proxyAddress, proxyPort;
     private final NetworkDiagnostics diagnostics;
-    private final VpnTcpOwnerDiagnostics ownerDiagnostics;
+    private final SyntheticMappings mappings;
+    private final Map<Integer, Flow> fallback = new HashMap<>();
+    private final Map<Integer, Long> revokedPorts = new HashMap<>();
     private volatile boolean running = true;
 
     private static int exclusiveSocketType(FileDescriptor fd) throws IOException {
@@ -81,6 +83,7 @@ final class VpnFlowRegistry implements AutoCloseable {
     static final class Flow {
         final Key key;
         final LocalSocket owner;
+        String hostname; // Only fallback flows; never exposed to diagnostics.
         final long expires = SystemClock.elapsedRealtime() + MAX_LIFETIME_MS;
         long lastActivity = SystemClock.elapsedRealtime();
         boolean active, revoked;
@@ -91,8 +94,8 @@ final class VpnFlowRegistry implements AutoCloseable {
         Flow(Key key, LocalSocket owner, Flow control) { this.key = key; this.owner = owner; this.control = control; }
     }
 
-    VpnFlowRegistry(File directory, int proxyAddress, int proxyPort, NetworkDiagnostics diagnostics, VpnTcpOwnerDiagnostics ownerDiagnostics) throws IOException {
-        this.ownerDiagnostics = ownerDiagnostics;
+    VpnFlowRegistry(File directory, int proxyAddress, int proxyPort, NetworkDiagnostics diagnostics, SyntheticMappings mappings) throws IOException {
+        this.mappings = mappings;
         this.proxyAddress = proxyAddress; this.proxyPort = proxyPort; this.diagnostics = diagnostics;
         path = new File(directory, "nbs-flow.sock");
         // The service is a singleton. A stale filesystem name grants no capability.
@@ -265,6 +268,7 @@ final class VpnFlowRegistry implements AutoCloseable {
     }
 
     synchronized Flow authorizeTcp(Key key, boolean syn, int sequence, int source) {
+        if (source != 0x0a000002) { diagnostics.dropTcp(TcpDrop.SOURCE_ADDRESS); return null; }
         Flow flow = flows.get(key);
         if (flow == null) {
             // This is a lookup against the current bounded registry, not packet history.
@@ -277,9 +281,33 @@ final class VpnFlowRegistry implements AutoCloseable {
                 }
             }
             TcpDrop rejection = VpnTcpDecision.missingTuple(registeredSourcePort);
-            diagnostics.dropTcp(rejection);
-            ownerDiagnostics.observe(rejection, syn, source, key.sourcePort, key.address, key.port);
-            return null;
+            if (rejection != TcpDrop.NO_REGISTRATION) { diagnostics.dropTcp(rejection); return null; }
+            if (revokedPorts.containsKey(key.sourcePort)) {
+                diagnostics.dropTcp(TcpDrop.EXPIRED_REVOKED); return null;
+            }
+            Flow retained = fallback.get(key.sourcePort);
+            if (retained != null) {
+                if (!retained.key.equals(key)) { diagnostics.dropTcp(TcpDrop.TUPLE_MISMATCH); return null; }
+                TcpDrop invalid = VpnTcpDecision.validate(live(retained), retained.active, syn,
+                        retained.initialSequence, sequence);
+                if (invalid != null) { diagnostics.dropTcp(invalid); return null; }
+                retained.lastActivity = SystemClock.elapsedRealtime();
+                return retained;
+            }
+            if (!syn) { diagnostics.dropTcp(TcpDrop.NO_REGISTRATION); return null; }
+            if (!running || fallback.size() + flows.size() >= MAX_FLOWS || key.port == 0 ||
+                    key.sourcePort == 0 || !fallbackAddress(key.address)) {
+                diagnostics.dropTcp(TcpDrop.OTHER_POLICY); return null;
+            }
+            String hostname = mappings.lookup(key.address);
+            if (SyntheticMappings.synthetic(key.address) && hostname == null) {
+                diagnostics.increment(SYNTHETIC_MISS); diagnostics.dropTcp(TcpDrop.OTHER_POLICY); return null;
+            }
+            Flow accepted = new Flow(key, null, null);
+            accepted.hostname = hostname; accepted.active = true; accepted.initialSequence = sequence;
+            fallback.put(key.sourcePort, accepted);
+            diagnostics.increment(FALLBACK_ACCEPTED); diagnostics.increment(TCP_FIRST_SYN);
+            return accepted;
         }
         TcpDrop rejection = VpnTcpDecision.validate(live(flow), flow.active, syn, flow.initialSequence, sequence);
         if (rejection != null) { diagnostics.dropTcp(rejection); return null; }
@@ -308,9 +336,25 @@ final class VpnFlowRegistry implements AutoCloseable {
 
     synchronized boolean live(Flow flow) {
         long now = SystemClock.elapsedRealtime();
-        return flow != null && !flow.revoked && flows.get(flow.key) == flow &&
-                now < flow.expires && now - flow.lastActivity < IDLE_MS && channelLive(flow.owner) &&
+        if (!running || flow == null || flow.revoked || now >= flow.expires || now - flow.lastActivity >= IDLE_MS)
+            return false;
+        if (flow.owner == null) return fallback.get(flow.key.sourcePort) == flow &&
+                (!SyntheticMappings.synthetic(flow.key.address) || flow.hostname.equals(mappings.lookup(flow.key.address)));
+        return flows.get(flow.key) == flow && channelLive(flow.owner) &&
                 (flow.control == null || (!flow.control.remoteClosed && live(flow.control)));
+    }
+
+    private static boolean fallbackAddress(int address) {
+        // The selective TUN authorizes Internet TCP, not local/control-plane access.
+        int first = address >>> 24;
+        return first != 0 && first != 127 && first < 224 && address != 0x0a000001 &&
+                address != 0x0a000002 && (address & 0xffff0000) != 0xa9fe0000;
+    }
+
+    synchronized void endFallback(Flow flow) {
+        if (flow.owner == null && !flow.revoked) {
+            flow.revoked = true; flow.lastActivity = SystemClock.elapsedRealtime();
+        }
     }
 
     private boolean channelLive(LocalSocket channel) {
@@ -341,6 +385,16 @@ final class VpnFlowRegistry implements AutoCloseable {
     }
 
     synchronized void expire() {
+        long now = SystemClock.elapsedRealtime();
+        revokedPorts.values().removeIf(until -> now >= until);
+        for (Iterator<Flow> it = fallback.values().iterator(); it.hasNext();) {
+            Flow flow = it.next();
+            if (!live(flow)) {
+                if (!flow.revoked) { flow.revoked = true; flow.lastActivity = now; }
+                // Preserve tuple/generation denial through kernel TIME_WAIT and delayed packets.
+                if (now - flow.lastActivity >= IDLE_MS) it.remove();
+            }
+        }
         for (Iterator<Flow> it = flows.values().iterator(); it.hasNext();) {
             Flow flow = it.next(); pruneTickets(flow);
             if (!live(flow)) { revoke(flow); it.remove(); }
@@ -348,14 +402,17 @@ final class VpnFlowRegistry implements AutoCloseable {
     }
 
     private void revoke(Flow flow) {
-        if (!flow.revoked) { flow.revoked = true; diagnostics.increment(REGISTRATION_ENDED); }
+        if (!flow.revoked) {
+            flow.revoked = true; diagnostics.increment(REGISTRATION_ENDED);
+            if (flow.key.protocol == 6) revokedPorts.put(flow.key.sourcePort, SystemClock.elapsedRealtime() + IDLE_MS);
+        }
     }
 
     @Override public void close() {
         running = false;
         synchronized (this) {
             for (Flow flow : flows.values()) revoke(flow);
-            flows.clear();
+            flows.clear(); fallback.clear(); revokedPorts.clear();
             for (LocalSocket channel : new ArrayList<>(channels)) try { channel.close(); } catch (IOException ignored) { }
         }
         try { server.close(); } catch (IOException ignored) { }
