@@ -91,7 +91,8 @@ final class VpnRelay implements AutoCloseable {
             listener = new ServerSocket();
             listener.bind(new InetSocketAddress(InetAddress.getByAddress(LOCAL_BYTES), 0), 64);
             listenerPort = listener.getLocalPort();
-            registry = new VpnFlowRegistry(files, proxyAddress, proxyPort, diagnostics);
+            registry = new VpnFlowRegistry(files, proxyAddress, proxyPort, diagnostics,
+                    new VpnTcpOwnerDiagnostics(new AndroidTcpOwnerLookup(service), android.os.Process.myUid(), diagnostics));
             new Thread(this::acceptTcp, "NBSVpnAccept").start();
         } catch (Exception failure) {
             failure(FailureStage.SETUP_DENY_ALL);
@@ -181,7 +182,7 @@ final class VpnRelay implements AutoCloseable {
         boolean syn = (flags & 0x17) == 2;
         if ((flags & 2) != 0 && !syn) { diagnostics.dropTcp(TcpDrop.SYN_GENERATION); return; }
         VpnFlowRegistry.Key key = new VpnFlowRegistry.Key(6, sourcePort, destination, destinationPort);
-        VpnFlowRegistry.Flow grant = registry.authorizeTcp(key, syn, i32(packet, 24));
+        VpnFlowRegistry.Flow grant = registry.authorizeTcp(key, syn, i32(packet, 24), source);
         if (grant == null) return; // Registry recorded the exact rejection.
         synchronized (this) {
             Tcp connection = tcp.get(sourcePort);

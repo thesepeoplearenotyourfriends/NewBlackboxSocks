@@ -47,6 +47,7 @@ final class VpnFlowRegistry implements AutoCloseable {
     private final File path;
     private final int proxyAddress, proxyPort;
     private final NetworkDiagnostics diagnostics;
+    private final VpnTcpOwnerDiagnostics ownerDiagnostics;
     private volatile boolean running = true;
 
     private static int exclusiveSocketType(FileDescriptor fd) throws IOException {
@@ -90,7 +91,8 @@ final class VpnFlowRegistry implements AutoCloseable {
         Flow(Key key, LocalSocket owner, Flow control) { this.key = key; this.owner = owner; this.control = control; }
     }
 
-    VpnFlowRegistry(File directory, int proxyAddress, int proxyPort, NetworkDiagnostics diagnostics) throws IOException {
+    VpnFlowRegistry(File directory, int proxyAddress, int proxyPort, NetworkDiagnostics diagnostics, VpnTcpOwnerDiagnostics ownerDiagnostics) throws IOException {
+        this.ownerDiagnostics = ownerDiagnostics;
         this.proxyAddress = proxyAddress; this.proxyPort = proxyPort; this.diagnostics = diagnostics;
         path = new File(directory, "nbs-flow.sock");
         // The service is a singleton. A stale filesystem name grants no capability.
@@ -262,7 +264,7 @@ final class VpnFlowRegistry implements AutoCloseable {
         if (control != null) control.lastActivity = flow.lastActivity;
     }
 
-    synchronized Flow authorizeTcp(Key key, boolean syn, int sequence) {
+    synchronized Flow authorizeTcp(Key key, boolean syn, int sequence, int source) {
         Flow flow = flows.get(key);
         if (flow == null) {
             // This is a lookup against the current bounded registry, not packet history.
@@ -274,7 +276,9 @@ final class VpnFlowRegistry implements AutoCloseable {
                     registeredSourcePort = true; break;
                 }
             }
-            diagnostics.dropTcp(VpnTcpDecision.missingTuple(registeredSourcePort));
+            TcpDrop rejection = VpnTcpDecision.missingTuple(registeredSourcePort);
+            diagnostics.dropTcp(rejection);
+            ownerDiagnostics.observe(rejection, syn, source, key.sourcePort, key.address, key.port);
             return null;
         }
         TcpDrop rejection = VpnTcpDecision.validate(live(flow), flow.active, syn, flow.initialSequence, sequence);

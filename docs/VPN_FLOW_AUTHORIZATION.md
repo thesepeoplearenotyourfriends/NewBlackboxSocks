@@ -151,3 +151,22 @@ traffic against a UDP-capable endpoint, ordinary unregistered TCP/UDP sockets,
 guest close/death and source-port reuse, idle/hard expiry, and VPN stop/restart.
 Verify counters and endpoint observations together. Android delegated networking
 is deliberately denied. Compilation or installed hooks are not runtime PASS.
+
+### Unregistered TCP owner evidence
+
+At the existing no-retained-registration rejection, valid outgoing initial SYNs
+query Android 10+ `ConnectivityManager.getConnectionOwnerUid` with TCP and the
+exact unmodified VPN source/destination endpoints. The comparison uses the host
+process real `Process.myUid()`, shared by NBS/BlackBox guest subprocesses.
+The Settings screen and Copy diagnostics show only saturating aggregate counts:
+NBS UID, another UID, INVALID_UID/no owner, and unavailable/failed lookup. NBS
+results are split into synthetic fake-DNS IPv4 (198.18.0.0/15) and ordinary IPv4.
+These count SYN observations, including retransmissions, not unique flows.
+No tuples or owner UID values are retained by diagnostics. Unsupported APIs,
+exceptions and ownership races remain rejected, as do positively identified NBS
+misses. Registered authorization and normal bridge topology are unchanged.
+
+Device follow-up: keep NBS → socksbridge.py → 3proxy:1080, reset diagnostics,
+reproduce once in Via, and inspect/copy the owner categories and destination-kind
+counts. Framework ownership accuracy and races, API fallback, clipboard/UI,
+and continued fail-closed packet handling require device validation.
