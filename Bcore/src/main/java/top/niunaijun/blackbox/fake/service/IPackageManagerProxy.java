@@ -144,6 +144,11 @@ public class IPackageManagerProxy extends BinderInvocationStub {
                 if (packageInfo.requestedPermissions != null && packageInfo.requestedPermissionsFlags != null) {
                     for (int i = 0; i < packageInfo.requestedPermissions.length; i++) {
                         String perm = packageInfo.requestedPermissions[i];
+                        if (android.Manifest.permission.INTERNET.equals(perm)) {
+                            Integer internet = GuestInternetPermission.check("checkPermission",
+                                    new Object[]{perm, packageName, BlackBoxCore.getUserId()});
+                            GuestInternetPermission.applyRequestedPermissionFlag(packageInfo, i, internet);
+                        }
                         if (perm != null && (perm.equals(android.Manifest.permission.RECORD_AUDIO)
                                 || perm.equals("android.permission.FOREGROUND_SERVICE_MICROPHONE")
                                 || perm.equals(android.Manifest.permission.MODIFY_AUDIO_SETTINGS)
@@ -412,6 +417,8 @@ public class IPackageManagerProxy extends BinderInvocationStub {
     public static class SimpleAudioPermissionHook extends MethodHook {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            Integer internet = GuestInternetPermission.check(method.getName(), args);
+            if (internet != null) return internet;
             String permission = (String) args[0];
             String packageName = (String) args[1];
             
@@ -435,6 +442,15 @@ public class IPackageManagerProxy extends BinderInvocationStub {
             
             
             return method.invoke(who, args);
+        }
+    }
+
+    @ProxyMethod("checkUidPermission")
+    public static class CheckUidPermission extends MethodHook {
+        @Override
+        protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            Integer internet = GuestInternetPermission.check(method.getName(), args);
+            return internet != null ? internet : method.invoke(who, args);
         }
     }
 

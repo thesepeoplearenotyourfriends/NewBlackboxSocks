@@ -42,6 +42,7 @@ import top.niunaijun.blackbox.fake.frameworks.BPackageManager;
 import top.niunaijun.blackbox.fake.hook.ClassInvocationStub;
 import top.niunaijun.blackbox.fake.hook.MethodHook;
 import top.niunaijun.blackbox.fake.hook.ProxyMethod;
+import top.niunaijun.blackbox.fake.hook.ProxyMethods;
 import top.niunaijun.blackbox.fake.hook.ScanClass;
 import top.niunaijun.blackbox.fake.service.base.PkgMethodProxy;
 import top.niunaijun.blackbox.fake.service.context.providers.ContentProviderStub;
@@ -773,10 +774,14 @@ public class IActivityManagerProxy extends ClassInvocationStub {
         }
     }
 
-    @ProxyMethod("checkPermission")
+    @ProxyMethods({"checkPermission", "checkPermissionForDevice"})
     public static class checkPermission extends MethodHook {
         @Override
         protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            Integer internet = GuestInternetPermission.check(method.getName(), args);
+            if (internet != null) return internet;
+            // Device-aware checks end in deviceId, not uid. Preserve unrelated permission behavior.
+            if (method.getName().equals("checkPermissionForDevice")) return method.invoke(who, args);
             MethodParameterUtils.replaceLastUid(args);
             String permission = (String) args[0];
             if (permission.equals(Manifest.permission.ACCOUNT_MANAGER)
