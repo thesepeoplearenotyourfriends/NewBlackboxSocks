@@ -47,12 +47,6 @@ class SettingFragment : PreferenceFragmentCompat() {
             daemonPreference
         }
 
-        invalidHideState {
-            val vpnPreference: Preference = (findPreference("use_vpn_network")!!)
-            val mUseVpnNetwork = AppManager.mBlackBoxLoader.useVpnNetwork()
-            vpnPreference.setDefaultValue(mUseVpnNetwork)
-            vpnPreference
-        }
 
         invalidHideState {
             val disableFlagSecurePreference: Preference = (findPreference("disable_flag_secure")!!)
@@ -61,7 +55,6 @@ class SettingFragment : PreferenceFragmentCompat() {
             disableFlagSecurePreference
         }
 
-        initSendLogs()
     }
 
     private fun initGms() {
@@ -91,9 +84,6 @@ class SettingFragment : PreferenceFragmentCompat() {
                 "daemon_enable" -> {
                     AppManager.mBlackBoxLoader.invalidDaemonEnable(tmpHide)
                 }
-                "use_vpn_network" -> {
-                    AppManager.mBlackBoxLoader.invalidUseVpnNetwork(tmpHide)
-                }
                 "disable_flag_secure" -> {
                     AppManager.mBlackBoxLoader.invalidDisableFlagSecure(tmpHide)
                 }
@@ -101,28 +91,6 @@ class SettingFragment : PreferenceFragmentCompat() {
 
             toast(R.string.restart_module)
             return@setOnPreferenceChangeListener true
-        }
-    }
-    private fun initSendLogs() {
-        val sendLogsPreference: Preference? = findPreference("send_logs")
-        sendLogsPreference?.setOnPreferenceClickListener {
-            it.isEnabled = false
-            BlackBoxCore.get()
-                    .sendLogs(
-                            "Manual Log Upload from Settings",
-                            true,
-                            object : BlackBoxCore.LogSendListener {
-                                override fun onSuccess() {
-                                    activity?.runOnUiThread { sendLogsPreference.isEnabled = true }
-                                }
-
-                                override fun onFailure(error: String?) {
-                                    activity?.runOnUiThread { sendLogsPreference.isEnabled = true }
-                                }
-                            }
-                    )
-            toast("Sending logs... (Check notifications for status)")
-            true
         }
     }
 }

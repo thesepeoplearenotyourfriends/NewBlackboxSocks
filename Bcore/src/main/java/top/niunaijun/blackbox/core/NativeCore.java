@@ -37,7 +37,7 @@ public class NativeCore {
         boolean guest = BlackBoxCore.get().isBlackProcess();
         SharedPreferences preferences = BlackBoxCore.getContext().getSharedPreferences(
                 "AppSharedPreferenceDelegate", Context.MODE_PRIVATE);
-        initNative(apiLevel, guest, preferences.getBoolean("mSocksEnabled", false),
+        initNative(apiLevel, guest, true /* intrinsic BlackSocks policy, regardless of legacy preferences */,
                 preferences.getString("mSocksHost", "127.0.0.1"),
                 parsePort(preferences.getString("mSocksPort", "1080")),
                 preferences.getString("mSocksUser", ""),

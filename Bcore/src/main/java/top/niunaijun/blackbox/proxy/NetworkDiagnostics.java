@@ -101,7 +101,7 @@ public final class NetworkDiagnostics {
         public String toPlainText(boolean socksEnabledInSettings) {
             StringBuilder out = new StringBuilder("Network Diagnostics\n");
             out.append("VPN active: ").append(vpnActive ? "yes" : "no");
-            out.append("\nSOCKS enabled (Settings): ").append(socksEnabledInSettings ? "yes" : "no");
+            out.append("\nSOCKS enabled (policy): ").append(socksEnabledInSettings ? "yes" : "no");
             out.append("\nVPN relay active: ").append(relayActive ? "yes" : "no");
             out.append("\n\nRegistrations\n");
             line(out, "accepted requests", Counter.REGISTERED);

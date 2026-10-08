@@ -15,7 +15,7 @@
     <string name="close_fake_location">禁用虛擬位置</string>
     <string name="close_app_fake_location">是否關閉%s的虛擬定位</string>
     <string name="close_fake_location_success">成功禁用%s的虛擬定位</string>
-    <string name="setting">軟件設定</string>
+    <string name="setting">全域設定</string>
     <string name="jump_module">轉到模塊管理器</string>
     <string name="module_setting">模塊管理器</string>
     <string name="enable_xposed">啟用Xposed框架</string>

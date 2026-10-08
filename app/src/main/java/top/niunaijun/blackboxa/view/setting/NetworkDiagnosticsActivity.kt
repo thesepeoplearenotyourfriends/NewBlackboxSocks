@@ -50,9 +50,7 @@ class NetworkDiagnosticsActivity : BaseActivity() {
     }
 
     private fun summary(): String {
-        val socksEnabled = getSharedPreferences("AppSharedPreferenceDelegate", Context.MODE_PRIVATE)
-            .getBoolean("mSocksEnabled", false)
-        return ProxyVpnService.getDiagnosticsSnapshot().toPlainText(socksEnabled)
+        return ProxyVpnService.getDiagnosticsSnapshot().toPlainText(true)
     }
 
     private fun refreshSummary() {

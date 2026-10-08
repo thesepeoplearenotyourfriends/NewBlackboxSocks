@@ -78,7 +78,8 @@ public class ProxyVpnService extends VpnService {
             int port;
             try { port = Integer.parseInt(settings.getString("mSocksPort", "1080")); }
             catch (NumberFormatException invalid) { port = 0; }
-            boolean configured = settings.getBoolean("mSocksEnabled", false) && address != 0 && port > 0 && port <= 65535
+            // SOCKS is intrinsic; invalid configuration still leaves the relay deny-all.
+            boolean configured = address != 0 && port > 0 && port <= 65535
                     && settings.getString("mSocksUser", "").getBytes(StandardCharsets.UTF_8).length <= 255
                     && settings.getString("mSocksPassword", "").getBytes(StandardCharsets.UTF_8).length <= 255;
             relay = new VpnRelay(this, mVpnInterface, getFilesDir(), address, port, configured,
