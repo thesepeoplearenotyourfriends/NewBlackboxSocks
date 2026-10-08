@@ -1198,9 +1198,7 @@ ssize_t hookedRead(int fd, void *buffer, size_t size) {
 }
 ssize_t hookedWriteV(int fd, const iovec *vectors, int count) {
     if (!config.requested || !udpState(fd, false)) {
-        long long total = 0;
-        for (int i = 0; i < count; ++i) total += static_cast<long long>(vectors[i].iov_len);
-        traceTcpPostConnect(fd, "writev", total);
+        traceTcpPostConnect(fd, "writev", count);
         return originalWriteV(fd, vectors, count);
     }
     size_t total = 0; for (int i = 0; i < count; ++i) total += vectors[i].iov_len;
@@ -1210,9 +1208,7 @@ ssize_t hookedWriteV(int fd, const iovec *vectors, int count) {
 }
 ssize_t hookedReadV(int fd, const iovec *vectors, int count) {
     if (!config.requested || !udpState(fd, false)) {
-        long long total = 0;
-        for (int i = 0; i < count; ++i) total += static_cast<long long>(vectors[i].iov_len);
-        traceTcpPostConnect(fd, "readv", total);
+        traceTcpPostConnect(fd, "readv", count);
         return originalReadV(fd, vectors, count);
     }
     size_t total = 0; for (int i = 0; i < count; ++i) total += vectors[i].iov_len;
