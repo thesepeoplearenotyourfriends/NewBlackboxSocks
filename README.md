@@ -4,7 +4,7 @@
   <img src="assets/blacksocks-icon.svg" alt="BlackSocks: overlapping red B and S on black" width="192" />
 </p>
 
-A corny-but-awesome icon for a useful idea: run Android apps inside BlackBox and send their Internet traffic through SOCKS5, without root or modifying the guest APKs.
+Idea: run Android apps inside BlackBox and send their Internet traffic through SOCKS5, without root or modifying the guest APKs.
 
 BlackSocks is a fork of the BlackBox/NewBlackbox Android virtualization engine. It clones apps into its own virtual environment, where you launch them independently of their normally installed copies. This fork focuses on transparent SOCKS5 networking for those guest apps.
 
