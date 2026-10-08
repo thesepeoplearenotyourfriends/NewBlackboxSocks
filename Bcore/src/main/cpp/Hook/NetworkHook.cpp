@@ -51,6 +51,8 @@ using Dup2Fn = int (*)(int, int);
 using Dup3Fn = int (*)(int, int, int);
 using SendMMsgFn = int (*)(int, mmsghdr *, unsigned, int);
 using RecvMMsgFn = int (*)(int, mmsghdr *, unsigned, int, timespec *);
+using GetSockOptFn = int (*)(int, int, int, void *, socklen_t *);
+using GetPeerNameFn = int (*)(int, sockaddr *, socklen_t *);
 SocketFn originalSocket;
 SendToFn originalSendTo;
 RecvFromFn originalRecvFrom;
@@ -68,6 +70,8 @@ Dup2Fn originalDup2;
 Dup3Fn originalDup3;
 SendMMsgFn originalSendMMsg;
 RecvMMsgFn originalRecvMMsg;
+GetSockOptFn originalGetSockOpt;
+GetPeerNameFn originalGetPeerName;
 using NetHandle = uint64_t; // android.net.Network#getNetworkHandle / net_handle_t.
 using SetNetworkFn = int (*)(NetHandle, int);
 using SetProcessNetworkFn = int (*)(NetHandle);
@@ -234,6 +238,62 @@ struct Config {
     std::string user;
     std::string password;
 } config;
+
+// Short-lived diagnostic trace for the first guest-visible operations after a
+// successful synthetic-host SOCKS DOMAIN CONNECT.  This is deliberately bounded
+// and follows dup aliases so one navigation cannot flood logcat.
+struct TcpPostConnectTrace {
+    std::mutex mutex;
+    std::string hostname;
+    unsigned events = 0;
+};
+constexpr unsigned kTcpPostConnectTraceLimit = 24;
+std::mutex tcpPostConnectTracesMutex;
+std::unordered_map<int, std::shared_ptr<TcpPostConnectTrace>> tcpPostConnectTraces;
+
+std::shared_ptr<TcpPostConnectTrace> tcpPostConnectTraceFor(int fd) {
+    std::lock_guard<std::mutex> lock(tcpPostConnectTracesMutex);
+    auto found = tcpPostConnectTraces.find(fd);
+    return found == tcpPostConnectTraces.end() ? nullptr : found->second;
+}
+
+void armTcpPostConnectTrace(int fd, const std::string &hostname, bool nonblocking) {
+    auto trace = std::make_shared<TcpPostConnectTrace>();
+    trace->hostname = hostname;
+    {
+        std::lock_guard<std::mutex> lock(tcpPostConnectTracesMutex);
+        tcpPostConnectTraces[fd] = trace;
+    }
+    ALOGD("NetworkTcpTrace: ARM host=%s fd=%d nonblock=%d guest_connect=%s",
+          hostname.c_str(), fd, nonblocking ? 1 : 0, nonblocking ? "EINPROGRESS" : "0");
+}
+
+void traceTcpPostConnect(int fd, const char *operation, long long detail = -1, int error = 0) {
+    auto trace = tcpPostConnectTraceFor(fd);
+    if (!trace) return;
+    unsigned sequence;
+    std::string hostname;
+    {
+        std::lock_guard<std::mutex> lock(trace->mutex);
+        if (trace->events >= kTcpPostConnectTraceLimit) return;
+        sequence = ++trace->events;
+        hostname = trace->hostname;
+    }
+    ALOGD("NetworkTcpTrace: host=%s fd=%d seq=%u op=%s detail=%lld errno=%d",
+          hostname.c_str(), fd, sequence, operation, detail, error);
+}
+
+void removeTcpPostConnectTrace(int fd) {
+    std::lock_guard<std::mutex> lock(tcpPostConnectTracesMutex);
+    tcpPostConnectTraces.erase(fd);
+}
+
+void duplicateTcpPostConnectTrace(int from, int to) {
+    std::lock_guard<std::mutex> lock(tcpPostConnectTracesMutex);
+    auto found = tcpPostConnectTraces.find(from);
+    if (found != tcpPostConnectTraces.end()) tcpPostConnectTraces[to] = found->second;
+    else tcpPostConnectTraces.erase(to);
+}
 
 int64_t nowMs() {
     timespec ts{};
@@ -781,6 +841,7 @@ ssize_t udpSend(int fd, const void *buffer, size_t size, int flags,
 int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
     if (!config.requested) return originalConnect(fd, address, length);
     if (!address || length < sizeof(sa_family_t)) { errno = EINVAL; return -1; }
+    if (address->sa_family != AF_UNIX) traceTcpPostConnect(fd, "connect-again");
     if (address->sa_family == AF_UNIX) {
         if (!loggedUnix.exchange(true)) ALOGD("NetworkPolicy: AF_UNIX passthrough");
         return originalConnect(fd, address, length);
@@ -927,9 +988,51 @@ int hookedConnect(int fd, const sockaddr *address, socklen_t length) {
     bool reportInProgress = result == 0 && (flags & O_NONBLOCK);
     int savedErrno = reportInProgress ? EINPROGRESS : errno;
     if (!(flags & O_NONBLOCK) && fcntl(fd, F_SETFL, flags) != 0 && result == 0) { savedErrno = errno; result = -1; }
+    if (synthetic && result == 0)
+        armTcpPostConnectTrace(fd, hostname, (flags & O_NONBLOCK) != 0);
     if (result != 0) releaseFlow(fd);
     errno = savedErrno;
     return reportInProgress ? -1 : result;
+}
+
+int hookedGetSockOpt(int fd, int level, int option, void *value, socklen_t *length) {
+    int result = originalGetSockOpt(fd, level, option, value, length);
+    int savedErrno = errno;
+    if (level == SOL_SOCKET && option == SO_ERROR) {
+        long long socketError = -1;
+        if (result == 0 && value && length && *length >= sizeof(int))
+            socketError = *reinterpret_cast<int *>(value);
+        traceTcpPostConnect(fd, "getsockopt-SO_ERROR", socketError,
+                            result == 0 ? 0 : savedErrno);
+    }
+    errno = savedErrno;
+    return result;
+}
+
+int hookedGetPeerName(int fd, sockaddr *address, socklen_t *length) {
+    int result = originalGetPeerName(fd, address, length);
+    int savedErrno = errno;
+    const char *operation = "getpeername-failed";
+    long long port = -1;
+    if (result == 0 && address && length) {
+        bool proxyPeer = false;
+        if (address->sa_family == AF_INET && *length >= sizeof(sockaddr_in)) {
+            auto *peer = reinterpret_cast<sockaddr_in *>(address);
+            port = ntohs(peer->sin_port);
+            proxyPeer = peer->sin_port == config.proxy.sin_port &&
+                        peer->sin_addr.s_addr == config.proxy.sin_addr.s_addr;
+        } else if (address->sa_family == AF_INET6 && *length >= sizeof(sockaddr_in6)) {
+            auto *peer = reinterpret_cast<sockaddr_in6 *>(address);
+            port = ntohs(peer->sin6_port);
+            proxyPeer = IN6_IS_ADDR_V4MAPPED(&peer->sin6_addr) &&
+                        peer->sin6_port == config.proxy.sin_port &&
+                        memcmp(&peer->sin6_addr.s6_addr[12], &config.proxy.sin_addr.s_addr, 4) == 0;
+        }
+        operation = proxyPeer ? "getpeername-proxy" : "getpeername-other";
+    }
+    traceTcpPostConnect(fd, operation, port, result == 0 ? 0 : savedErrno);
+    errno = savedErrno;
+    return result;
 }
 
 ssize_t hookedSendTo(int fd, const void *buffer, size_t size, int flags,
@@ -938,8 +1041,10 @@ ssize_t hookedSendTo(int fd, const void *buffer, size_t size, int flags,
     if (address && address->sa_family == AF_UNIX)
         return originalSendTo(fd, buffer, size, flags, address, length);
     int type = 0, domain = AF_UNSPEC; socklen_t tl = sizeof(type);
-    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) || type != SOCK_DGRAM)
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) || type != SOCK_DGRAM) {
+        traceTcpPostConnect(fd, "sendto", static_cast<long long>(size));
         return originalSendTo(fd, buffer, size, flags, address, length);
+    }
     tl = sizeof(domain);
     if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &tl) || (domain != AF_INET && domain != AF_INET6))
         return originalSendTo(fd, buffer, size, flags, address, length);
@@ -1016,7 +1121,10 @@ ssize_t udpReceive(int fd, void *buffer, size_t size, int flags, sockaddr *sourc
 }
 
 ssize_t hookedRecvFrom(int fd, void *buffer, size_t size, int flags, sockaddr *source, socklen_t *length) {
-    if (!config.requested || !udpState(fd, false)) return originalRecvFrom(fd, buffer, size, flags, source, length);
+    if (!config.requested || !udpState(fd, false)) {
+        traceTcpPostConnect(fd, "recvfrom", static_cast<long long>(size));
+        return originalRecvFrom(fd, buffer, size, flags, source, length);
+    }
     return udpReceive(fd, buffer, size, flags, source, length, nullptr);
 }
 
@@ -1025,8 +1133,10 @@ ssize_t hookedSendMsg(int fd, const msghdr *message, int flags) {
     if (message->msg_name && reinterpret_cast<const sockaddr *>(message->msg_name)->sa_family == AF_UNIX)
         return originalSendMsg(fd, message, flags);
     int type = 0, domain = AF_UNSPEC; socklen_t tl = sizeof(type);
-    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) || type != SOCK_DGRAM)
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) || type != SOCK_DGRAM) {
+        traceTcpPostConnect(fd, "sendmsg");
         return originalSendMsg(fd, message, flags);
+    }
     tl = sizeof(domain);
     if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &tl) || (domain != AF_INET && domain != AF_INET6))
         return originalSendMsg(fd, message, flags);
@@ -1041,7 +1151,10 @@ ssize_t hookedSendMsg(int fd, const msghdr *message, int flags) {
 }
 
 ssize_t hookedRecvMsg(int fd, msghdr *message, int flags) {
-    if (!config.requested || !udpState(fd, false)) return originalRecvMsg(fd, message, flags);
+    if (!config.requested || !udpState(fd, false)) {
+        traceTcpPostConnect(fd, "recvmsg");
+        return originalRecvMsg(fd, message, flags);
+    }
     size_t total = 0; for (size_t i = 0; i < message->msg_iovlen; ++i) total += message->msg_iov[i].iov_len;
     std::vector<uint8_t> data(total); sockaddr_storage source{}; socklen_t sourceLength = sizeof(source);
     bool truncated = false;
@@ -1056,30 +1169,48 @@ ssize_t hookedRecvMsg(int fd, msghdr *message, int flags) {
 }
 
 ssize_t hookedSend(int fd, const void *buffer, size_t size, int flags) {
-    if (!config.requested || !udpState(fd, false)) return originalSend(fd, buffer, size, flags);
+    if (!config.requested || !udpState(fd, false)) {
+        traceTcpPostConnect(fd, "send", static_cast<long long>(size));
+        return originalSend(fd, buffer, size, flags);
+    }
     return udpSend(fd, buffer, size, flags, nullptr, 0);
 }
 ssize_t hookedRecv(int fd, void *buffer, size_t size, int flags) {
-    if (!config.requested || !udpState(fd, false)) return originalRecv(fd, buffer, size, flags);
+    if (!config.requested || !udpState(fd, false)) {
+        traceTcpPostConnect(fd, "recv", static_cast<long long>(size));
+        return originalRecv(fd, buffer, size, flags);
+    }
     return udpReceive(fd, buffer, size, flags, nullptr, nullptr, nullptr);
 }
 ssize_t hookedWrite(int fd, const void *buffer, size_t size) {
-    if (!config.requested || !udpState(fd, false)) return originalWrite(fd, buffer, size);
+    if (!config.requested || !udpState(fd, false)) {
+        traceTcpPostConnect(fd, "write", static_cast<long long>(size));
+        return originalWrite(fd, buffer, size);
+    }
     return udpSend(fd, buffer, size, 0, nullptr, 0);
 }
 ssize_t hookedRead(int fd, void *buffer, size_t size) {
-    if (!config.requested || !udpState(fd, false)) return originalRead(fd, buffer, size);
+    if (!config.requested || !udpState(fd, false)) {
+        traceTcpPostConnect(fd, "read", static_cast<long long>(size));
+        return originalRead(fd, buffer, size);
+    }
     return udpReceive(fd, buffer, size, 0, nullptr, nullptr, nullptr);
 }
 ssize_t hookedWriteV(int fd, const iovec *vectors, int count) {
-    if (!config.requested || !udpState(fd, false)) return originalWriteV(fd, vectors, count);
+    if (!config.requested || !udpState(fd, false)) {
+        traceTcpPostConnect(fd, "writev", count);
+        return originalWriteV(fd, vectors, count);
+    }
     size_t total = 0; for (int i = 0; i < count; ++i) total += vectors[i].iov_len;
     std::vector<uint8_t> data(total); size_t at = 0;
     for (int i = 0; i < count; ++i) { memcpy(data.data() + at, vectors[i].iov_base, vectors[i].iov_len); at += vectors[i].iov_len; }
     return udpSend(fd, data.data(), data.size(), 0, nullptr, 0);
 }
 ssize_t hookedReadV(int fd, const iovec *vectors, int count) {
-    if (!config.requested || !udpState(fd, false)) return originalReadV(fd, vectors, count);
+    if (!config.requested || !udpState(fd, false)) {
+        traceTcpPostConnect(fd, "readv", count);
+        return originalReadV(fd, vectors, count);
+    }
     size_t total = 0; for (int i = 0; i < count; ++i) total += vectors[i].iov_len;
     std::vector<uint8_t> data(total);
     ssize_t result = udpReceive(fd, data.data(), data.size(), 0, nullptr, nullptr, nullptr);
@@ -1096,14 +1227,30 @@ int hookedSocket(int domain, int type, int protocol) {
         ALOGE("NetworkPolicy: unhandled Internet path=socket type=%d protocol=%d", type & 0xf, protocol);
     return fd;
 }
-int hookedClose(int fd) { releaseFlow(fd); { std::lock_guard<std::mutex> lock(udpStatesMutex); udpStates.erase(fd); } return originalClose(fd); }
+int hookedClose(int fd) {
+    traceTcpPostConnect(fd, "close");
+    removeTcpPostConnectTrace(fd);
+    releaseFlow(fd);
+    { std::lock_guard<std::mutex> lock(udpStatesMutex); udpStates.erase(fd); }
+    return originalClose(fd);
+}
 void duplicateState(int from, int to) {
     { std::lock_guard<std::mutex> lock(flowLeasesMutex); auto it = flowLeases.find(from); if (it != flowLeases.end()) flowLeases[to] = it->second; else flowLeases.erase(to); }
     { std::lock_guard<std::mutex> lock(udpStatesMutex); auto it = udpStates.find(from); if (it != udpStates.end()) udpStates[to] = it->second; else udpStates.erase(to); }
+    duplicateTcpPostConnectTrace(from, to);
 }
-int hookedDup(int fd) { int result = originalDup(fd); if (result >= 0) duplicateState(fd, result); return result; }
-int hookedDup2(int fd, int target) { int result = originalDup2(fd, target); if (result >= 0) duplicateState(fd, result); return result; }
-int hookedDup3(int fd, int target, int flags) { int result = originalDup3(fd, target, flags); if (result >= 0) duplicateState(fd, result); return result; }
+int hookedDup(int fd) {
+    traceTcpPostConnect(fd, "dup");
+    int result = originalDup(fd); if (result >= 0) duplicateState(fd, result); return result;
+}
+int hookedDup2(int fd, int target) {
+    traceTcpPostConnect(fd, "dup2", target);
+    int result = originalDup2(fd, target); if (result >= 0) duplicateState(fd, result); return result;
+}
+int hookedDup3(int fd, int target, int flags) {
+    traceTcpPostConnect(fd, "dup3", target);
+    int result = originalDup3(fd, target, flags); if (result >= 0) duplicateState(fd, result); return result;
+}
 int hookedSendMMsg(int fd, mmsghdr *messages, unsigned count, int flags) {
     int type = 0; socklen_t length = sizeof(type);
     if (!config.requested || getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) || type != SOCK_DGRAM)
@@ -1225,6 +1372,8 @@ void NetworkHook::init() {
         }
     };
     requiredHook("socket", reinterpret_cast<void *>(hookedSocket), reinterpret_cast<void **>(&originalSocket));
+    requiredHook("getsockopt", reinterpret_cast<void *>(hookedGetSockOpt), reinterpret_cast<void **>(&originalGetSockOpt));
+    requiredHook("getpeername", reinterpret_cast<void *>(hookedGetPeerName), reinterpret_cast<void **>(&originalGetPeerName));
     requiredHook("sendto", reinterpret_cast<void *>(hookedSendTo), reinterpret_cast<void **>(&originalSendTo));
     requiredHook("recvfrom", reinterpret_cast<void *>(hookedRecvFrom), reinterpret_cast<void **>(&originalRecvFrom));
     requiredHook("sendmsg", reinterpret_cast<void *>(hookedSendMsg), reinterpret_cast<void **>(&originalSendMsg));
@@ -1255,7 +1404,7 @@ void NetworkHook::init() {
         xdl_close(netd);
     }
     ALOGD("NetworkPolicy: coverage native=socket,connect,getaddrinfo,android_getaddrinfofornet,"
-          "send,recv,read,write,readv,writev,sendto,sendmsg,recvfrom,recvmsg,close,dup* "
+          "getsockopt,getpeername,send,recv,read,write,readv,writev,sendto,sendmsg,recvfrom,recvmsg,close,dup* "
           "sendmmsg/recvmmsg=%s libcore=Os-native-entrypoints "
           "Binder=virtual-view/no-DNS bindSocket=%s WebView=libc",
           mmsg ? "installed" : "unavailable", networkBinding ? "virtualized" : "unavailable");
