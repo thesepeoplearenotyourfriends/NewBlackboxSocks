@@ -1,7 +1,6 @@
 package top.niunaijun.blackboxa.view.base
 
 import android.view.KeyEvent
-import androidx.core.content.ContextCompat
 import com.roger.catloadinglibrary.CatLoadingView
 import top.niunaijun.blackboxa.R
 
@@ -17,7 +16,7 @@ abstract class LoadingActivity : BaseActivity() {
         }
 
         if (!loadingView.isAdded) {
-            loadingView.setBackgroundColor(ContextCompat.getColor(this, R.color.surface))
+            loadingView.setBackgroundColor(R.color.surface)
             loadingView.show(supportFragmentManager, "")
             supportFragmentManager.executePendingTransactions()
             loadingView.setClickCancelAble(false)
