@@ -16,7 +16,7 @@
     <string name="close_fake_location">Disable FakeLocation</string>
     <string name="close_app_fake_location">Disable FakeLocation for %s</string>
     <string name="close_fake_location_success">Disable FakeLocation for %s Successfully</string>
-    <string name="setting">Setting</string>
+    <string name="setting">Global Settings</string>
     <string name="jump_module">Go to Module Manager</string>
     <string name="module_setting">Module Manager</string>
     <string name="enable_xposed">Enable Xposed Framework</string>
@@ -67,4 +67,8 @@
     <string name="disable_gms">Disable Service</string>
     <string name="disable_gms_hint">Clear the current Google service environment? Google service data will be cleared.</string>
     <string name="no_gms">Currently, there is no Google service environment on mobile phones.</string>
+    <string name="app_settings">App Settings</string>
+    <string name="app_settings_package">Package</string>
+    <string name="app_settings_user">Virtual user ID</string>
+    <string name="app_settings_empty">No per-app controls are available yet.</string>
 </resources>

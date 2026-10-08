@@ -27,6 +27,7 @@ import top.niunaijun.blackboxa.util.inflate
 import top.niunaijun.blackboxa.util.MemoryManager
 import top.niunaijun.blackboxa.util.toast
 import top.niunaijun.blackboxa.view.base.LoadingActivity
+import top.niunaijun.blackboxa.view.setting.AppSettingsActivity
 import top.niunaijun.blackboxa.view.main.MainActivity
 import java.util.*
 import kotlin.math.abs
@@ -346,6 +347,10 @@ class AppsFragment : Fragment() {
                                         } else {
                                             unInstallApk(data)
                                         }
+                                    }
+
+                                    R.id.app_settings -> {
+                                        AppSettingsActivity.start(requireContext(), data.packageName, userID, data.name)
                                     }
 
                                     R.id.app_clear -> {

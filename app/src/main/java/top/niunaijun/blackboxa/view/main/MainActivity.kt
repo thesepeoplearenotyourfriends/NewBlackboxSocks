@@ -9,10 +9,12 @@ import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.viewpager2.widget.ViewPager2
 import com.afollestad.materialdialogs.MaterialDialog
 import com.afollestad.materialdialogs.input.input
+import top.niunaijun.blackbox.proxy.ProxyVpnService
 import top.niunaijun.blackbox.BlackBoxCore
 import top.niunaijun.blackboxa.R
 import top.niunaijun.blackboxa.app.App
@@ -22,7 +24,6 @@ import top.niunaijun.blackboxa.util.Resolution
 import top.niunaijun.blackboxa.util.inflate
 import top.niunaijun.blackboxa.view.apps.AppsFragment
 import top.niunaijun.blackboxa.view.base.LoadingActivity
-import top.niunaijun.blackboxa.view.fake.FakeManagerActivity
 import top.niunaijun.blackboxa.view.list.ListActivity
 import top.niunaijun.blackboxa.view.setting.SettingActivity
 
@@ -213,10 +214,20 @@ class MainActivity : LoadingActivity() {
             } else {
                 
                 Log.d(TAG, "VPN permission already granted")
+                ensureVpnServiceRunning()
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error checking VPN permission: ${e.message}")
         }
+    }
+
+    private fun ensureVpnServiceRunning() {
+        // Reinvoke onStartCommand after consent, including a service started before consent.
+        ContextCompat.startForegroundService(
+            this, Intent(this, ProxyVpnService::class.java).apply {
+                action = VpnService.SERVICE_INTERFACE
+            }
+        )
     }
 
     private val vpnPermissionResult =
@@ -224,6 +235,7 @@ class MainActivity : LoadingActivity() {
                 try {
                     if (result.resultCode == RESULT_OK) {
                         Log.d(TAG, "VPN permission granted!")
+                        ensureVpnServiceRunning()
                         
                     } else {
                         Log.w(TAG, "VPN permission denied by user")
@@ -412,16 +424,6 @@ class MainActivity : LoadingActivity() {
                 }
                 R.id.main_setting -> {
                     SettingActivity.start(this)
-                }
-                R.id.main_tg -> {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/newblackboxa"))
-                    startActivity(intent)
-                }
-                R.id.fake_location -> {
-                    
-                    val intent = Intent(this, FakeManagerActivity::class.java)
-                    intent.putExtra("userID", 0)
-                    startActivity(intent)
                 }
             }
 
