@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="512" android:viewportHeight="512">
+    <group android:pivotX="256" android:pivotY="256" android:scaleX="0.9" android:scaleY="0.9">
+        <group android:translateY="30">
+        <path android:fillColor="#D52B36" android:strokeColor="#F5F1E8" android:strokeWidth="11" android:strokeLineJoin="round" android:fillType="evenOdd" android:pathData="M 119,117 L 144,96 L 189,96 C 239,96 268,119 268,159 C 268,185 254,201 236,210 C 260,220 277,242 277,272 C 277,319 242,345 192,345 L 144,345 L 119,324 L 142,312 L 142,131 Z M 180,132 L 180,193 L 193,193 C 217,193 230,182 230,163 C 230,143 217,132 193,132 Z M 180,229 L 180,307 L 196,307 C 224,307 239,293 239,270 C 239,243 222,229 196,229 Z" />
+        <path android:fillColor="#D52B36" android:strokeColor="#F5F1E8" android:strokeWidth="11" android:strokeLineJoin="round" android:fillType="evenOdd" android:pathData="M 365,179 L 334,151 C 324,135 308,128 290,128 C 267,128 252,141 252,158 C 252,177 267,187 299,197 C 345,211 373,234 373,274 C 373,321 338,350 294,350 C 269,350 249,343 234,329 L 218,340 L 218,278 L 249,303 C 260,318 276,325 294,325 C 318,325 333,309 333,289 C 333,271 319,260 289,251 C 242,236 214,216 214,176 C 214,130 247,101 290,101 C 312,101 331,107 345,120 L 365,110 Z" />
+        </group>
+    </group>
+</vector>

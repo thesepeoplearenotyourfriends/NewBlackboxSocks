@@ -68,7 +68,7 @@ android {
     }
     applicationVariants.configureEach { variant ->
         variant.outputs.configureEach { output ->
-            output.outputFileName = "BlackBox_${variant.versionName}_${output.baseName}.apk"
+            output.outputFileName = "BlackSocks_${variant.versionName}_${output.baseName}.apk"
         }
     }
 }
