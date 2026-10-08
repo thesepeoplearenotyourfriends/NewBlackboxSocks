@@ -90,13 +90,73 @@ public final class FallbackTest {
             rejects(() -> FallbackSocks.negotiate(new ByteArrayInputStream(bad),out,EMPTY,EMPTY,DEST,443,null));
         rejects(() -> FallbackSocks.negotiate(new ByteArrayInputStream(bytes(5,2,1,1)),out,bytes('u'),bytes('p'),DEST,443,null));
     }
+    static void stageFailure(Socket socket, Checked action, NetworkDiagnostics.FailureStage stage) throws Exception {
+        try { action.run(); throw new AssertionError("expected transport failure"); }
+        catch (FallbackTransport.Failure failure) {
+            check(failure.stage == stage && socket.isClosed());
+            NetworkDiagnostics diagnostics = new NetworkDiagnostics();
+            diagnostics.failure(failure.stage); diagnostics.fallbackFailure(failure.stage);
+            check(diagnostics.snapshot().count(FALLBACK_FAILED) == 1);
+            check(diagnostics.snapshot().lastFailureStage.equals(stage.label));
+            NetworkDiagnostics.Counter counter = stage == NetworkDiagnostics.FailureStage.FALLBACK_SOCKET ? FALLBACK_SOCKET_FAILED
+                    : stage == NetworkDiagnostics.FailureStage.FALLBACK_PROTECT ? FALLBACK_PROTECT_FAILED
+                    : stage == NetworkDiagnostics.FailureStage.FALLBACK_PROXY_CONNECT ? FALLBACK_PROXY_CONNECT_FAILED : FALLBACK_SOCKS_FAILED;
+            check(diagnostics.snapshot().count(counter) == 1);
+            String report = diagnostics.snapshot().toPlainText(true);
+            check(!report.contains("192.0.2.1") && !report.contains("host connect"));
+        }
+    }
     static void transport() throws Exception {
         ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor();
         try (ServerSocket proxy = new ServerSocket(0,1,InetAddress.getLoopbackAddress())) {
             InetSocketAddress endpoint = new InetSocketAddress(InetAddress.getLoopbackAddress(), proxy.getLocalPort());
-            Socket denied = new Socket();
-            rejects(() -> FallbackTransport.connect(denied,s -> false,endpoint,timer,EMPTY,EMPTY,DEST,443,null));
-            check(denied.isClosed() && !denied.isConnected());
+            check(FallbackTransport.localProxy(endpoint));
+            check(FallbackTransport.localProxy(new InetSocketAddress("127.0.0.2", 1080)));
+            check(FallbackTransport.localProxy(new InetSocketAddress("::1", 1080)));
+            for (NetworkInterface nic : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                for (InetAddress assigned : Collections.list(nic.getInetAddresses())) {
+                    check(FallbackTransport.localProxy(new InetSocketAddress(assigned, 1080)));
+                }
+            }
+            InetSocketAddress remote = new InetSocketAddress("192.0.2.1", 1080);
+            check(!FallbackTransport.localProxy(remote));
+            check(!FallbackTransport.localProxy(new InetSocketAddress("192.168.254.254", 1080)));
+            for (boolean throwsProtection : new boolean[]{false, true}) {
+                Socket denied = new Socket() {
+                    @Override public void connect(SocketAddress a, int timeout) {
+                        throw new AssertionError("connect after protection failure");
+                    }
+                };
+                int[] calls = {0};
+                stageFailure(denied, () -> FallbackTransport.connect(denied, sock -> {
+                    check(sock.isBound() && sock.getLocalPort() > 0 && !sock.isConnected());
+                    calls[0]++;
+                    if (throwsProtection) throw new IllegalStateException("host protector");
+                    return false;
+                }, remote, timer, EMPTY, EMPTY, DEST, 443, null),
+                        NetworkDiagnostics.FailureStage.FALLBACK_PROTECT);
+                check(calls[0] == 1 && !denied.isConnected());
+            }
+            // Deterministic boundary doubles verify ordering and prohibit direct retries.
+            List<String> events = new ArrayList<>();
+            Socket failedConnect = new Socket() {
+                @Override public void bind(SocketAddress a) throws IOException { events.add("bind"); super.bind(a); }
+                @Override public void connect(SocketAddress a, int timeout) throws IOException {
+                    events.add("connect"); throw new IOException("host connect");
+                }
+            };
+            stageFailure(failedConnect, () -> FallbackTransport.connect(failedConnect, sock -> {
+                check(sock.isBound() && !sock.isConnected()); events.add("protect"); return true;
+            }, remote, timer, EMPTY, EMPTY, DEST, 443, null),
+                    NetworkDiagnostics.FailureStage.FALLBACK_PROXY_CONNECT);
+            check(events.equals(Arrays.asList("bind", "protect", "connect")));
+            Socket failedBind = new Socket() {
+                @Override public void bind(SocketAddress a) throws IOException { throw new IOException("host bind"); }
+                @Override public void connect(SocketAddress a, int timeout) { throw new AssertionError("connect after bind failure"); }
+            };
+            stageFailure(failedBind, () -> FallbackTransport.connect(failedBind, sock -> {
+                throw new AssertionError("protect after bind failure");
+            }, remote, timer, EMPTY, EMPTY, DEST, 443, null), NetworkDiagnostics.FailureStage.FALLBACK_SOCKET);
             CompletableFuture<Void> served = CompletableFuture.runAsync(() -> {
                 try (Socket s = proxy.accept()) {
                     s.setSoTimeout(2000);
@@ -111,17 +171,29 @@ public final class FallbackTest {
             });
             try (Socket connected = new Socket()) {
                 int[] protectedCount = {0};
-                FallbackTransport.connect(connected,s -> {check(!s.isConnected()); protectedCount[0]++; return true;},
+                FallbackTransport.connect(connected,s -> {protectedCount[0]++; throw new AssertionError("local proxy must skip protect");},
                         endpoint,timer,EMPTY,EMPTY,DEST,443,null);
-                check(protectedCount[0] == 1 && connected.getPort() == proxy.getLocalPort());
+                check(protectedCount[0] == 0 && connected.getPort() == proxy.getLocalPort());
                 connected.getOutputStream().write(42); check(connected.getInputStream().read() == 43);
             }
             served.get(5,TimeUnit.SECONDS);
+            CompletableFuture<Void> badSocks = CompletableFuture.runAsync(() -> {
+                try (Socket sock = proxy.accept()) {
+                    sock.setSoTimeout(2000);
+                    new DataInputStream(sock.getInputStream()).readFully(new byte[3]);
+                    sock.getOutputStream().write(bytes(5,255));
+                } catch (Exception e) { throw new CompletionException(e); }
+            });
+            Socket rejected = new Socket();
+            stageFailure(rejected, () -> FallbackTransport.connect(rejected, sock -> {throw new AssertionError();},
+                    endpoint,timer,EMPTY,EMPTY,DEST,443,null), NetworkDiagnostics.FailureStage.FALLBACK_SOCKS);
+            badSocks.get(5,TimeUnit.SECONDS);
             try (ServerSocket unused = new ServerSocket(0)) {
                 int port = unused.getLocalPort(); unused.close();
                 Socket refused = new Socket();
-                rejects(() -> FallbackTransport.connect(refused,s -> true,new InetSocketAddress("127.0.0.1",port),
-                        timer,EMPTY,EMPTY,DEST,443,null)); check(refused.isClosed());
+                stageFailure(refused, () -> FallbackTransport.connect(refused,s -> {throw new AssertionError();},
+                        new InetSocketAddress("127.0.0.1",port), timer,EMPTY,EMPTY,DEST,443,null),
+                        NetworkDiagnostics.FailureStage.FALLBACK_PROXY_CONNECT);
             }
         } finally { timer.shutdownNow(); }
     }
@@ -175,7 +247,7 @@ public final class FallbackTest {
     }
     public static void main(String[] args) throws Exception {
         registry(); socks(); transport(); mappings(); cursor();
-        System.out.println("Fallback host checks passed: production registry/generations, SOCKS encodings/auth/rejections, protected proxy transport and byte exchange, concurrent global mappings/capacity.");
-        System.out.println("Android TUN, AF_UNIX peer credentials and native resolver IPC require device validation.");
+        System.out.println("Fallback host checks passed: production registry/generations, SOCKS encodings/auth/rejections, local proxy byte exchange, bind-before-protect ordering and transport failure stages, concurrent global mappings/capacity.");
+        System.out.println("Android VpnService/fd behavior, TUN, AF_UNIX peer credentials and native resolver IPC require device validation.");
     }
 }

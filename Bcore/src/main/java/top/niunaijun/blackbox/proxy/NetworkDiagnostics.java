@@ -11,7 +11,8 @@ public final class NetworkDiagnostics {
         TCP_SYN_GENERATION, TCP_MALFORMED, TCP_SOURCE_ADDRESS, TCP_OTHER_POLICY,
         TCP_LISTENER_REJECTED,
         FALLBACK_ACCEPTED, FALLBACK_CONNECTED, FALLBACK_IPV4, FALLBACK_DOMAIN,
-        SYNTHETIC_MISS, FALLBACK_FAILED,
+        SYNTHETIC_MISS, FALLBACK_FAILED, FALLBACK_SOCKET_FAILED, FALLBACK_PROTECT_FAILED,
+        FALLBACK_PROXY_CONNECT_FAILED, FALLBACK_SOCKS_FAILED,
         UDP_FLOWS, UDP_PACKETS, UDP_DROPPED, UDP_TICKET_EXPIRED,
         OTHER_DROPPED, RELAY_FAILED
     }
@@ -36,6 +37,8 @@ public final class NetworkDiagnostics {
         TCP_ACCEPT("tcp-accept"), TCP_SOCKET("tcp-socket"),
         TCP_LEASE_BEFORE_CONNECT("tcp-lease-before-connect"), TCP_PROTECT("tcp-protect"),
         TCP_CONNECT("tcp-connect"), TCP_LEASE_AFTER_CONNECT("tcp-lease-after-connect"),
+        FALLBACK_SOCKET("fallback-socket-create-bind"), FALLBACK_PROTECT("fallback-protect"),
+        FALLBACK_PROXY_CONNECT("fallback-proxy-connect"), FALLBACK_SOCKS("fallback-socks-negotiation"),
         TCP_IO("tcp-relay-io"), UDP_RELAY("udp-relay"), UDP_READ("udp-relay-read");
 
         final String label;
@@ -57,6 +60,16 @@ public final class NetworkDiagnostics {
         add(Counter.RELAY_FAILED);
         lastFailure = stage;
         return counters[Counter.RELAY_FAILED.ordinal()];
+    }
+    synchronized void fallbackFailure(FailureStage stage) {
+        add(Counter.FALLBACK_FAILED);
+        switch (stage) {
+            case FALLBACK_SOCKET: add(Counter.FALLBACK_SOCKET_FAILED); break;
+            case FALLBACK_PROTECT: add(Counter.FALLBACK_PROTECT_FAILED); break;
+            case FALLBACK_PROXY_CONNECT: add(Counter.FALLBACK_PROXY_CONNECT_FAILED); break;
+            case FALLBACK_SOCKS: add(Counter.FALLBACK_SOCKS_FAILED); break;
+            default: break;
+        }
     }
     synchronized void vpnActive(boolean active) { vpnActive = active; }
     synchronized void relayActive(boolean active) { relayActive = active; }
@@ -114,6 +127,10 @@ public final class NetworkDiagnostics {
             line(out, "DOMAIN CONNECTs established", Counter.FALLBACK_DOMAIN);
             line(out, "synthetic mapping misses", Counter.SYNTHETIC_MISS);
             line(out, "SOCKS transport/negotiation failures", Counter.FALLBACK_FAILED);
+            line(out, "socket creation/bind failures", Counter.FALLBACK_SOCKET_FAILED);
+            line(out, "VPN protection failures", Counter.FALLBACK_PROTECT_FAILED);
+            line(out, "proxy connect failures", Counter.FALLBACK_PROXY_CONNECT_FAILED);
+            line(out, "SOCKS negotiation failures", Counter.FALLBACK_SOCKS_FAILED);
             out.append("\nUDP\n");
             line(out, "authorized flows (first datagram sent)", Counter.UDP_FLOWS);
             line(out, "forwarded packets (guest to relay)", Counter.UDP_PACKETS);

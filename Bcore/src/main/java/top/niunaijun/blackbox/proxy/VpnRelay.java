@@ -277,7 +277,7 @@ final class VpnRelay implements AutoCloseable {
             local = accepted; return true;
         }
         void connect() {
-            FailureStage stage = FailureStage.TCP_SOCKET;
+            FailureStage stage = flow.owner == null ? FailureStage.FALLBACK_SOCKET : FailureStage.TCP_SOCKET;
             try {
                 Socket outward = new Socket();
                 synchronized (this) {
@@ -307,7 +307,8 @@ final class VpnRelay implements AutoCloseable {
                 new Thread(() -> pump(local, outward), "NBSVpnTcpUp").start();
                 pump(outward, local);
             } catch (Exception failure) {
-                if (running) { failure(stage); if (flow.owner == null) diagnostics.increment(FALLBACK_FAILED); }
+                if (failure instanceof FallbackTransport.Failure) stage = ((FallbackTransport.Failure) failure).stage;
+                if (running) { failure(stage); if (flow.owner == null) diagnostics.fallbackFailure(stage); }
                 close();
             }
         }
