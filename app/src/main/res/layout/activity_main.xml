@@ -36,6 +36,8 @@
             android:layout_height="wrap_content"
             android:layout_marginBottom="24dp"
             android:paddingBottom="12dp"
+            app:dotsColor="@color/secondary_text"
+            app:selectedDotColor="@color/accent"
             app:dotsCornerRadius="8dp"
             app:dotsSize="8dp"
             app:dotsSpacing="4dp"
@@ -54,6 +56,7 @@
             android:layout_marginBottom="24dp"
             android:contentDescription="TODO"
             android:src="@drawable/ic_add"
+            app:tint="@color/background"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintRight_toRightOf="parent" />
 

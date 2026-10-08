@@ -243,10 +243,10 @@ public class XiaomiPermissionManager {
             
             android.app.NotificationChannel mainChannel = new android.app.NotificationChannel(
                 "blackbox_main",
-                "BlackBox Core",
+                "BlackSocks Core",
                 NotificationManager.IMPORTANCE_HIGH
             );
-            mainChannel.setDescription("Core BlackBox functionality notifications");
+            mainChannel.setDescription("Core BlackSocks functionality notifications");
             mainChannel.enableLights(true);
             mainChannel.enableVibration(true);
             mainChannel.setShowBadge(true);
@@ -257,7 +257,7 @@ public class XiaomiPermissionManager {
             
             android.app.NotificationChannel backgroundChannel = new android.app.NotificationChannel(
                 "blackbox_background",
-                "BlackBox Background",
+                "BlackSocks Background",
                 NotificationManager.IMPORTANCE_LOW
             );
             backgroundChannel.setDescription("Background service notifications");

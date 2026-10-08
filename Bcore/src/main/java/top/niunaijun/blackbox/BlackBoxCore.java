@@ -1138,7 +1138,7 @@ public class BlackBoxCore extends ClientConfiguration {
         try {
             
             if (packageName.equals(getHostPkg())) {
-                return new InstallResult().installError("Cannot clone BlackBox app from within BlackBox. This would create infinite recursion and is not allowed for security reasons.");
+                return new InstallResult().installError("Cannot clone BlackSocks app from within BlackSocks. This would create infinite recursion and is not allowed for security reasons.");
             }
             
             PackageInfo packageInfo = getPackageManager().getPackageInfo(packageName, 0);
@@ -1156,7 +1156,7 @@ public class BlackBoxCore extends ClientConfiguration {
             if (packageInfo != null) {
                 String packageName = packageInfo.packageName;
                 if (packageName.equals(getHostPkg())) {
-                    return new InstallResult().installError("Cannot clone BlackBox app from within BlackBox. This would create infinite recursion and is not allowed for security reasons.");
+                    return new InstallResult().installError("Cannot clone BlackSocks app from within BlackSocks. This would create infinite recursion and is not allowed for security reasons.");
                 }
             }
         } catch (Exception e) {
@@ -2130,7 +2130,7 @@ public class BlackBoxCore extends ClientConfiguration {
                             }
                             
                             builder.setSmallIcon(android.R.drawable.stat_notify_error)
-                                   .setContentTitle("BlackBox Log Upload Failed")
+                                   .setContentTitle("BlackSocks Log Upload Failed")
                                    .setContentText(error)
                                    .setAutoCancel(true);
                                    
@@ -2161,7 +2161,7 @@ public class BlackBoxCore extends ClientConfiguration {
                             }
 
                             builder.setSmallIcon(android.R.drawable.stat_sys_upload_done)
-                                   .setContentTitle("BlackBox Log Upload")
+                                   .setContentTitle("BlackSocks Log Upload")
                                    .setContentText("Logs sent successfully")
                                    .setAutoCancel(true);
 

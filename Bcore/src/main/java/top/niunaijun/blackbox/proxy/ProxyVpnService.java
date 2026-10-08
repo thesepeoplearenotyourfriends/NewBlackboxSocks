@@ -29,7 +29,7 @@ public class ProxyVpnService extends VpnService {
         diagnostics = new NetworkDiagnostics();
         currentDiagnostics = diagnostics;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "BlackBox VPN Service", NotificationManager.IMPORTANCE_LOW);
+            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "BlackSocks VPN Service", NotificationManager.IMPORTANCE_LOW);
             channel.setShowBadge(false);
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) manager.createNotificationChannel(channel);
@@ -40,7 +40,7 @@ public class ProxyVpnService extends VpnService {
         try {
             Notification.Builder notification = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                     ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
-            Notification built = notification.setContentTitle("BlackBox VPN Active")
+            Notification built = notification.setContentTitle("BlackSocks VPN Active")
                     .setContentText("Containing sandboxed network traffic")
                     .setSmallIcon(android.R.drawable.ic_dialog_info).setOngoing(true).build();
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -59,7 +59,7 @@ public class ProxyVpnService extends VpnService {
         if (destroyed || mVpnInterface != null) return;
         NetworkDiagnostics.FailureStage stage = NetworkDiagnostics.FailureStage.VPN_ESTABLISH;
         try {
-            Builder builder = new Builder().setSession("BlackBox authorized SOCKS networking").setMtu(1500);
+            Builder builder = new Builder().setSession("BlackSocks authorized SOCKS networking").setMtu(1500);
             builder.addAddress("10.0.0.2", 32).addRoute("0.0.0.0", 0);
             // Capture unsupported IPv6 as well; it must not bypass the positive gate.
             builder.addAddress("fd00:6e62:73::2", 128).addRoute("::", 0);
