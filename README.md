@@ -1,111 +1,87 @@
-(Note this is an ongoing _attempt_ at this, its not currently high-functioning.)
+# BlackSocks (NewBlackboxSocks)
 
-# NewBlackboxSocks
+<p align="center">
+  <img src="assets/blacksocks-icon.svg" alt="BlackSocks: overlapping red B and S on black" width="192" />
+</p>
 
-NewBlackboxSocks is a fork of NewBlackbox focused on running ordinary Android
-applications inside the BlackBox virtual environment while transparently
-adapting guest Internet networking through a configured SOCKS5 proxy.
+A corny-but-awesome icon for a useful idea: run Android apps inside BlackBox and send their Internet traffic through SOCKS5, without root or modifying the guest APKs.
 
-The project is intentionally userspace-only:
+BlackSocks is a fork of the BlackBox/NewBlackbox Android virtualization engine. It clones apps into its own virtual environment, where you launch them independently of their normally installed copies. This fork focuses on transparent SOCKS5 networking for those guest apps.
 
-- no root requirement
-- no VPN/TUN requirement
-- no guest APK rewriting
-- no per-app source modification
+## What works today
 
-The networking layer is implemented inside the BlackBox guest runtime using
-the project's existing native-hook, libcore, and Binder virtualization
-machinery.
+**Unauthenticated SOCKS5 is working.** Real-world use has been confirmed with **Via browser**, **Prime Video**, and other apps. These are reported working examples, not a guarantee for every app, Android version, device, or streaming/DRM configuration.
 
-## Current networking direction
+**SOCKS username/password authentication is not functional yet.** The settings fields and protocol code exist, but authenticated connections are not currently a working feature. Use a SOCKS5 endpoint that accepts unauthenticated connections and leave both credential fields empty.
 
-The intended guest-networking model is:
+BlackBox features such as multiple app instances, fake location, and device information spoofing remain part of the underlying engine. App compatibility varies; virtualization does not guarantee that every app will run.
 
-```text
-guest application
-    |
-    | TCP / UDP / hostname resolution
-    v
-BlackBox guest networking policy
-    |
-    | SOCKS5
-    v
-configured SOCKS endpoint
+## How networking actually works
+
+SOCKS networking is built into the current BlackSocks app; there is no optional direct-network mode or “Use VPN Network” switch to enable.
+
+1. **Guest networking hooks intercept connections.** Native/Bionic, libcore, and Android network-service integration adapt guest networking to the configured SOCKS5 endpoint. TCP uses SOCKS5 CONNECT.
+2. **Hostnames use synthetic addresses.** Hooked hostname lookups return fake IPv4 addresses from `198.18.0.0/15`. BlackSocks maps those addresses back to hostnames and sends SOCKS DOMAIN requests so the proxy resolves the destination remotely. Unknown synthetic addresses are rejected.
+3. **An app-scoped Android VPN captures additional paths.** The local VPN/TUN relay forwards registered proxy flows and provides a SOCKS5 TCP fallback for connections that bypass the usual hooks, including some WebView/Chromium paths. Its outgoing sockets are protected from re-entering the VPN.
+4. **UDP depends on the SOCKS server.** Hooked UDP uses SOCKS5 UDP ASSOCIATE and authorized relay flows. The endpoint must support it; arbitrary unregistered UDP is dropped. Do not assume every UDP/QUIC app will work.
+
+Invalid proxy settings and failed SOCKS negotiations are intended to fail closed rather than silently use direct Internet access. The VPN captures IPv6 too, but its packet relay currently handles IPv4; IPv6 capture prevents a bypass and is not a claim of full IPv6 support. Local Android IPC (`AF_UNIX`) is left alone.
+
+### Does the VPN affect other apps?
+
+**BlackSocks does not route or proxy networking outside the BlackSocks app.** Android's VPN allowlist contains only the BlackSocks host package. Virtualized guests run under that host, so they are covered; apps launched normally outside BlackSocks keep their ordinary network paths, including the normally installed copy of a cloned app.
+
+Android shows a VPN permission prompt and VPN indicator because this uses `VpnService`. Android normally allows only one active VPN per user/profile, so starting BlackSocks can replace another VPN in that profile. The SOCKS endpoint supplies the onward connection; the local VPN is not a separate remote VPN service, and SOCKS5 itself does not add encryption.
+
+## Getting started
+
+1. Download `NewBlackboxSocks.apk` from the [latest successful build release](https://github.com/thesepeoplearenotyourfriends/NewBlackboxSocks/releases/tag/latest-newblackboxsocks) and install it. The published CI APK is **arm64-v8a**.
+2. Open BlackSocks and approve the Android VPN request.
+3. In **Settings → SOCKS5 proxy (guest apps)**, enter a reachable **numeric IPv4 address** and proxy port. Defaults are `127.0.0.1:1080`; that only works if a SOCKS server is running on the Android device. Leave **Username** and **Password** empty.
+4. Restart BlackSocks, including its VPN service and guest processes, after changing proxy settings so all networking layers use the new configuration.
+5. Add/clone an app into BlackSocks and launch it from inside BlackSocks. Launching its normal installed copy does not use this proxy configuration.
+
+## Requirements and compatibility
+
+- Android 5.0 (API 21) is the configured minimum; this is not a tested compatibility promise for every version up to the latest Android release.
+- The build configuration supports **arm64-v8a** and **armeabi-v7a**. Current CI validates and publishes arm64 only; x86 is not a configured APK target.
+- No root is required.
+- A reachable SOCKS5 server accepting unauthenticated connections is required for guest Internet access. UDP support requires UDP ASSOCIATE on that server.
+
+## Building from source
+
+Use the repository's Gradle wrapper with the toolchain used by [GitHub Actions](.github/workflows/build.yml):
+
+- JDK **21**
+- Android SDK platform **35** and build-tools **35.0.0**
+- Android NDK **29.0.13846066**
+
+```bash
+git clone https://github.com/thesepeoplearenotyourfriends/NewBlackboxSocks.git
+cd NewBlackboxSocks
+./gradlew assemblePerformance -PciAbi=arm64-v8a --no-daemon
 ```
 
-Current design rules:
-- guest TCP is transparently routed through SOCKS5;
-- hostnames use the fake-IP / SOCKS DOMAIN mechanism so destination DNS remains
-  remote to the SOCKS endpoint;
-- guest UDP uses SOCKS5 UDP ASSOCIATE when supported by the selected endpoint;
-- the configured SOCKS endpoint determines whether UDP is available;
-- AF_UNIX and ordinary local Android IPC are left alone;
-- failed SOCKS operation must not silently fall back to direct Internet access.
-The physical/network environment may provide an additional fail-closed boundary,
-but NewBlackboxSocks should still consistently classify and adapt known guest
-Internet paths itself.
-Build
-The canonical CI build is the arm64 performance APK:
-./gradlew assemblePerformance -PciAbi=arm64-v8a --no-daemon
+The BlackSocks APK is written to `app/build/outputs/apk/performance/`. The same build also produces the companion **WebViewProbe** diagnostic app under `webviewprobe/build/outputs/apk/performance/`; it is not the main BlackSocks app. Pull-request CI uploads both APKs as separate artifacts. Successful pushes to `main` also update the moving release linked above.
 
-The GitHub Actions build environment currently uses:
-- JDK 21
-- Android platform 35
-- Android build-tools 35.0.0
-- NDK 29.0.13846066
-- arm64-v8a CI target
-GitHub Actions is the clean build oracle for Codex work. A temporary Codex
-environment that lacks a usable Android SDK/NDK is not, by itself, evidence of
-a source-code failure.
-Successful pull-request builds publish the performance APK as a workflow
-artifact. Successful builds on main also update the moving
-latest-newblackboxsocks release. 
-Repository guidance
-AGENTS.md contains the current repository instructions for Codex, including
-build discipline, source-of-truth rules, and networking invariants.
-The historical README below is retained from the NewBlackbox base repository
-for provenance and background. Its old build instructions have been removed
-because they no longer describe this fork.
-Historical upstream README
-BlackBox - Virtual Engine
-BlackBox is a virtual engine that allows you to clone and run virtual applications on Android devices without installing APKs. This project works on Android 5.0 to 14.0+ and supports multiple architectures (ARM64, ARMv7, x86).
-Overview
-This enhanced edition includes bug fixes, stability improvements, and Android 14+ compatibility tailored for modern devices.
-Key Features
-- Virtual App Cloning: Run multiple instances of applications.
-- Sandboxed Environment: Isolated process execution.
-- No Root Required: Runs entirely in userspace.
-- Multi-Architecture: Support for 32-bit and 64-bit apps.
-- Device Spoofing: Modify device information for virtual apps.
-- Fake Location: Spoof GPS coordinates.
-Requirements
-- Android Version: Android 5.0 (API 21) or higher.
-- RAM: 2GB minimum recommended.
-- Architecture: ARMv7a, ARM64-v8a, x86.
-Integration
-To use BlackBox Core in your own project, add the AAR dependency:
-dependencies {
-    implementation fileTree(dir: "libs", include: ["*.aar"])
-}
+The current performance build uses the debug signing configuration. It is a development distribution, not a separately configured production signing setup.
 
-Refer to Docs.md for detailed API documentation.
-Troubleshooting
-- App Crashes: Check logcat for UID mismatches or permission errors.
-- Installation Failures: Verify potential architecture mismatches or storage permissions.
-- Android 15: Ensure you are using the latest build which handles stricter security policies.
-Credits
-- Main Developer: ALEX502
-- Original Framework: VirtualApp, VirtualAPK
-- Native Hooks: Dobby, xDL
-- Reflection: BlackReflection, FreeReflection
-License
-Copyright 2022 BlackBox
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-   http://www.apache.org/licenses/LICENSE-2.0
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+For core API background, see [Docs.md](Docs.md). That document and [RELEASE_NOTES.md](RELEASE_NOTES.md) include inherited/historical material; current source and build configuration take precedence. Contributors should read [AGENTS.md](AGENTS.md).
+
+## Troubleshooting
+
+- **No guest Internet:** Check the proxy IPv4 address/port, server reachability, empty credential fields, and Android VPN permission. The default loopback address is not a remote proxy.
+- **Settings changed but behavior did not:** Restart the VPN and all guest processes along with BlackSocks.
+- **Browser works but another app does not:** Check whether the app needs UDP, unsupported networking paths, or virtualization/DRM features. Via and Prime Video working does not establish universal compatibility.
+- **Need networking details:** Open **Settings → Network diagnostics** for VPN/relay state, failure stages, and aggregate rejection counters. Flow counts alone do not prove SOCKS negotiation or browsing succeeded. Use logcat for app crashes and permission/ABI problems; redact sensitive information before sharing logs.
+
+## Credits
+
+- BlackBox/NewBlackbox and original developer **ALEX502**
+- VirtualApp and VirtualAPK
+- Dobby and xDL
+- BlackReflection and FreeReflection
+
+## License
+
+Copyright 2022 BlackBox. Licensed under the [Apache License, Version 2.0](LICENSE).
