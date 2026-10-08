@@ -2,6 +2,11 @@ package top.niunaijun.blackbox.fake.service;
 
 import android.content.pm.PackageManager;
 
+import java.lang.reflect.Method;
+
+import top.niunaijun.blackbox.fake.hook.MethodHook;
+import top.niunaijun.blackbox.fake.hook.ProxyMethods;
+
 import black.android.app.BRActivityThread;
 import black.android.app.BRContextImpl;
 import black.android.os.BRServiceManager;
@@ -52,6 +57,15 @@ public class IPermissionManagerProxy extends BinderInvocationStub {
             addMethodHook(new ValueMethodProxy("notifyPackageUse", 0));
             addMethodHook(new ValueMethodProxy("setInstantAppCookie", false));
             addMethodHook(new ValueMethodProxy("isInstantApp", false));
+        }
+    }
+
+    @ProxyMethods({"checkPermission", "checkUidPermission"})
+    public static class CheckInternetPermission extends MethodHook {
+        @Override
+        protected Object hook(Object who, Method method, Object[] args) throws Throwable {
+            Integer internet = GuestInternetPermission.check(method.getName(), args);
+            return internet != null ? internet : method.invoke(who, args);
         }
     }
 

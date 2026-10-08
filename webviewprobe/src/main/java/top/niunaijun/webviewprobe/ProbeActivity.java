@@ -184,7 +184,49 @@ public abstract class ProbeActivity extends Activity {
         emit(id, "ENV", "pid=" + Process.myPid() + " uid=" + Process.myUid()
                 + " process=" + processName() + " package=" + getPackageName()
                 + " api=" + Build.VERSION.SDK_INT + " webviewProvider=" + provider);
+        logInternetPermission(id, "ENV");
+        if (webView != null) logWebNetworkSettings(id, "ENV");
         emit(id, "ENV", "EXIT");
+    }
+
+    private void logInternetPermission(long id, String stage) {
+        try {
+            int uid = Process.myUid();
+            int pid = Process.myPid();
+            int self = Build.VERSION.SDK_INT >= 23
+                    ? checkSelfPermission(android.Manifest.permission.INTERNET)
+                    : checkCallingOrSelfPermission(android.Manifest.permission.INTERNET);
+            int explicit = checkPermission(android.Manifest.permission.INTERNET, pid, uid);
+            int application = getApplicationContext().checkPermission(android.Manifest.permission.INTERNET, pid, uid);
+            int pkg = getPackageManager().checkPermission(android.Manifest.permission.INTERNET, getPackageName());
+            boolean declared = false;
+            boolean requestedGranted = false;
+            try {
+                android.content.pm.PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), android.content.pm.PackageManager.GET_PERMISSIONS);
+                if (info.requestedPermissions != null) for (int i = 0; i < info.requestedPermissions.length; i++) {
+                    if (android.Manifest.permission.INTERNET.equals(info.requestedPermissions[i])) {
+                        declared = true;
+                        requestedGranted = info.requestedPermissionsFlags != null && i < info.requestedPermissionsFlags.length
+                                && (info.requestedPermissionsFlags[i] & android.content.pm.PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0;
+                    }
+                }
+            } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+                emit(id, "INTERNET_PERMISSION", "stage=" + stage + " manifest=UNAVAILABLE");
+            }
+            emit(id, "INTERNET_PERMISSION", "stage=" + stage + " pid=" + pid + " uid=" + uid
+                    + " applicationUid=" + getApplicationInfo().uid + " self=" + self
+                    + " explicit=" + explicit + " application=" + application + " package=" + pkg
+                    + " declared=" + declared + " requestedGranted=" + requestedGranted);
+        } catch (RuntimeException e) { failure(id, "INTERNET_PERMISSION_" + stage, e); }
+    }
+
+    private void logWebNetworkSettings(long id, String stage) {
+        if (webView == null) return;
+        try {
+            WebSettings settings = webView.getSettings();
+            emit(id, "WEB_NETWORK", "stage=" + stage + " blockNetworkLoads=" + settings.getBlockNetworkLoads()
+                    + " blockNetworkImage=" + settings.getBlockNetworkImage() + " cacheMode=" + settings.getCacheMode());
+        } catch (RuntimeException e) { failure(id, "WEB_NETWORK_" + stage, e); }
     }
 
     private String processName() {
@@ -257,8 +299,18 @@ public abstract class ProbeActivity extends Activity {
         long id = begin("CREATE_WEBVIEW");
         if (webView != null) { emit(id, "CREATE_WEBVIEW", "ALREADY_CREATED EXIT"); return; }
         try {
+            logInternetPermission(id, "BEFORE_CREATE");
             webView = new WebView(this);
             WebSettings s = webView.getSettings();
+            logWebNetworkSettings(id, "AFTER_CREATE");
+            // Record the original setting before changing it: blocked loads become cache-only in Chromium.
+            try {
+                s.setBlockNetworkLoads(false);
+                emit(id, "WEB_NETWORK", "UNBLOCK_REQUEST RETURNED");
+            } catch (RuntimeException e) {
+                failure(id, "WEB_NETWORK_UNBLOCK", e);
+            }
+            logWebNetworkSettings(id, "AFTER_UNBLOCK");
             s.setJavaScriptEnabled(true);
             s.setCacheMode(WebSettings.LOAD_NO_CACHE);
             s.setDomStorageEnabled(true);
@@ -303,6 +355,8 @@ public abstract class ProbeActivity extends Activity {
         long id = begin(type);
         if (!requireWeb(id, type)) return;
         try {
+            logInternetPermission(id, "BEFORE_TOP_LEVEL");
+            logWebNetworkSettings(id, "BEFORE_TOP_LEVEL");
             String url = testUrl(id).toString(); webAction = id;
             if (post) webView.postUrl(url, "webviewprobe=1".getBytes(java.nio.charset.StandardCharsets.UTF_8));
             else webView.loadUrl(url);
@@ -314,6 +368,7 @@ public abstract class ProbeActivity extends Activity {
         long id = begin(type);
         if (!requireWeb(id, type)) return;
         try {
+            logWebNetworkSettings(id, "BEFORE_JS");
             String code = function + "(" + (argument ? org.json.JSONObject.quote(testUrl(id).toString()) : "") + ")";
             webAction = id;
             webView.evaluateJavascript(code, value -> emit(id, type, "JS_COMPLETION EXIT"));
